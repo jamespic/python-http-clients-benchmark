@@ -19,6 +19,8 @@ import aiohttp
 import httpx
 import httpx_aiohttp
 import niquests
+import orjson
+import pycurl
 import pyreqwest.client
 import trio
 import uvloop
@@ -495,6 +497,158 @@ class NiquestsUvloopBenchmark(NiquestsBenchmark, UvloopBenchmark):
     pass
 
 
+@dataclass(frozen=True)
+class CurlFDState:
+    read: bool
+    write: bool
+
+
+FD_STATES = {
+    pycurl.POLL_IN: CurlFDState(read=True, write=False),
+    pycurl.POLL_OUT: CurlFDState(read=False, write=True),
+    pycurl.POLL_INOUT: CurlFDState(read=True, write=True),
+    pycurl.POLL_REMOVE: CurlFDState(read=False, write=False),
+}
+FD_STATES_DEFAULT = CurlFDState(read=False, write=False)
+
+
+class PyCurlBenchmark(AsyncioBenchmark):
+    async def setUp(self):
+        self._loop = asyncio.get_running_loop()
+        self._multi = pycurl.CurlMulti()
+        self._current_fd_states = {}
+        self._multi.setopt(pycurl.M_TIMERFUNCTION, self._set_timeout)
+        self._multi.setopt(pycurl.M_SOCKETFUNCTION, self._handle_socket)
+        self._in_flight_curls: dict[pycurl.Curl, asyncio.Future] = {}
+        self._timeout_handle: asyncio.TimerHandle | None = None
+        self._curl_limit_remaining = MAX_CONNECTION_POOL_SIZE
+        self._reuse_pool = asyncio.Queue(maxsize=MAX_CONNECTION_POOL_SIZE)
+        self._stopped = False
+        await super().setUp()
+
+    async def tearDown(self):
+        # Clean up all curl handles
+        await super().tearDown()
+        for curl, future in self._in_flight_curls.items():
+            curl.close()
+            future.cancel()
+        while not self._reuse_pool.empty():
+            curl = await self._reuse_pool.get()
+            curl.close()
+        self._multi.close()
+        self._stopped = True
+
+    def _set_timeout(self, msecs: int) -> None:
+        """Called by libcurl to schedule a timeout."""
+        if self._timeout_handle is not None:
+            self._timeout_handle.cancel()
+        if msecs >= 0:
+            self._timeout_handle = self._loop.call_later(
+                msecs / 1000.0, self._handle_timeout
+            )
+
+    async def _get_curl(self) -> pycurl.Curl:
+        if self._reuse_pool.empty() and self._curl_limit_remaining > 0:
+            curl = pycurl.Curl()
+            curl.setopt(pycurl.SSL_VERIFYPEER, True)
+            curl.setopt(pycurl.CAINFO, server_ca_cert_location)
+            self._curl_limit_remaining -= 1
+            return curl
+        else:
+            return await self._reuse_pool.get()
+
+    def _handle_socket(
+        self, event: int, fd: int, multi: pycurl.CurlMulti, data: bytes
+    ) -> None:
+        """Called by libcurl when the state of a socket changes."""
+        new_state = FD_STATES[event]
+        old_state = self._current_fd_states.get(fd, FD_STATES_DEFAULT)
+        if event == pycurl.POLL_REMOVE:
+            del self._current_fd_states[fd]
+        else:
+            self._current_fd_states[fd] = new_state
+        if old_state.read != new_state.read:
+            if new_state.read:
+                self._loop.add_reader(
+                    fd, self._multi.socket_action, fd, pycurl.CSELECT_IN
+                )
+            else:
+                self._loop.remove_reader(fd)
+        if old_state.write != new_state.write:
+            if new_state.write:
+                self._loop.add_writer(
+                    fd, self._multi.socket_action, fd, pycurl.CSELECT_OUT
+                )
+            else:
+                self._loop.remove_writer(fd)
+        self._loop.call_soon(self._finish_pending_requests)
+
+    def _handle_timeout(self) -> None:
+        """Called by IOLoop when the requested timeout has passed."""
+        self._timeout = None
+        self._multi.socket_action(pycurl.SOCKET_TIMEOUT, 0)
+        self._loop.call_soon(self._finish_pending_requests)
+
+    def _finish_pending_requests(self):
+        while not self._stopped:
+            num_q, ok_list, err_list = self._multi.info_read()
+            for curl in ok_list:
+                self._in_flight_curls[curl].set_result(None)
+                del self._in_flight_curls[curl]
+            for curl, errnum, errmsg in err_list:
+                self._in_flight_curls[curl].set_exception(pycurl.error(errnum, errmsg))
+                del self._in_flight_curls[curl]
+            if num_q == 0:
+                break
+
+    async def make_request(self):
+        curl = await self._get_curl()
+        future = asyncio.Future()
+        self._in_flight_curls[curl] = future
+        curl.setopt(pycurl.URL, self._url)
+        if self._body is not None:
+            curl.setopt(pycurl.POST, True)
+            curl.setopt(pycurl.HTTPHEADER, ["Content-Type: application/json"])
+            curl.setopt(pycurl.POSTFIELDS, orjson.dumps(self._body))
+
+        response: bytes | None = None
+
+        def write_function(data):
+            nonlocal response
+            if response is None:
+                response = data
+            else:
+                response += data
+            return len(data)
+
+        curl.setopt(pycurl.WRITEFUNCTION, write_function)
+
+        headers = {}
+
+        def header_function(header_line):
+            header_line = header_line.decode("iso-8859-1")
+            if ":" in header_line:
+                name, value = header_line.split(":", 1)
+                headers[name.strip()] = value.strip()
+
+        curl.setopt(pycurl.HEADERFUNCTION, header_function)
+
+        self._multi.add_handle(curl)
+        try:
+            await future
+            assert curl.getinfo(pycurl.RESPONSE_CODE) in (200, 404)
+            if headers.get("Content-Type") == "application/json":
+                assert response is not None
+                orjson.loads(response)
+        finally:
+            self._multi.remove_handle(curl)
+            self._reuse_pool.put_nowait(curl)
+
+
+class PyCurlUvloopBenchmark(PyCurlBenchmark, UvloopBenchmark):
+    pass
+
+
 TEST_CLASSES = {
     "httpx_asyncio": HttpxAsyncioBenchmark,
     "httpx_uvloop": HttpxUvloopBenchmark,
@@ -509,6 +663,8 @@ TEST_CLASSES = {
     "aiohttp_uvloop": AiohttpUvloopBenchmark,
     "niquests": NiquestsBenchmark,
     "niquests_uvloop": NiquestsUvloopBenchmark,
+    "pycurl": PyCurlBenchmark,
+    "pycurl_uvloop": PyCurlUvloopBenchmark,
 }
 
 
