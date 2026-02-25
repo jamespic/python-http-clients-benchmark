@@ -317,6 +317,7 @@ class HttpxBenchmark(BaseBenchmark):
     async def make_client(self) -> httpx.AsyncClient:
         return await self.exit_stack.enter_async_context(
             httpx.AsyncClient(
+                http2=True,
                 verify=ssl_context,
                 timeout=self._timeout,
                 limits=httpx.Limits(max_connections=MAX_CONNECTION_POOL_SIZE),
@@ -359,6 +360,7 @@ class HttpxPyreqwestBenchmark(HttpxBenchmark, AsyncioBenchmark):
             .add_root_certificate_pem(server_ca_cert_pem)
             .timeout(datetime.timedelta(seconds=self._timeout))
             .max_connections(MAX_CONNECTION_POOL_SIZE)
+            .http2(True)
             .build()
         )
         return await self.exit_stack.enter_async_context(
@@ -397,6 +399,7 @@ class PyreqwestBenchmark(AsyncioBenchmark):
             .add_root_certificate_pem(server_ca_cert_pem)
             .timeout(datetime.timedelta(seconds=self._timeout))
             .max_connections(MAX_CONNECTION_POOL_SIZE)
+            .http2(True)
             .error_for_status(True)
             .build()
         )
