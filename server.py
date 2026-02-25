@@ -23,7 +23,6 @@ async def handle_hello_world(scope, receive, send):
 
 async def handle_latency(scope, receive, send):
     assert scope["type"] == "http"
-    await asyncio.sleep(1.0)
     await send(
         {
             "type": "http.response.start",
@@ -33,6 +32,7 @@ async def handle_latency(scope, receive, send):
             ],
         }
     )
+    await asyncio.sleep(1.0)
     await send(
         {
             "type": "http.response.body",

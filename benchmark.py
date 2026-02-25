@@ -4,6 +4,7 @@ import ssl
 import subprocess
 import sys
 import time
+import traceback
 from contextlib import AsyncExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from enum import StrEnum
@@ -142,6 +143,7 @@ class BaseBenchmark:
         expected_duration: float,
         body: dict | None = None,
         timeout: float = 10.0,
+        debug: bool = False,
     ):
         self._start_time_generator = start_time_generator
         self._output_file = open(output_file, "w")
@@ -151,6 +153,7 @@ class BaseBenchmark:
         self._timeout = timeout
         self._overall_stats = Stats()
         self._current_stats = Stats()
+        self._debug = debug
 
     async def make_request(self):
         raise NotImplementedError("Subclasses must implement make_request")
@@ -229,6 +232,10 @@ class BaseBenchmark:
         self._output_file.write(f"failure,{start_time_monotonic},{repr(error)}\n")
         self._maybe_print_stats()
         self._current_stats.record_failure(latency)
+        if self._debug:
+            traceback.print_exception(
+                type(error), error, error.__traceback__, file=sys.stderr
+            )
 
     def _record_delay(self, start_time_monotonic: float, delay: float):
         self._output_file.write(f"delay,{start_time_monotonic},{delay}\n")
@@ -538,9 +545,11 @@ def run_server(type_: ServerTypes = ServerTypes.HTTPS2):
             yield base_url
         finally:
             process.terminate()
-        return_code = process.wait(5)
-        if return_code is None:
-            process.kill()
+
+        try:
+            process.wait(5)
+        except subprocess.TimeoutExpired:
+            subprocess.run(["pkill", "-SIGKILL", "-P", str(process.pid)])
 
 
 @dataclass
@@ -589,6 +598,9 @@ if __name__ == "__main__":
         default=1.0,
         help="Final request rate (requests per second)",
     )
+    parser.add_argument(
+        "--debug", action="store_true", help="Print debug information during the test"
+    )
     args = parser.parse_args()
 
     with run_server(args.server_type) as base_url:
@@ -602,5 +614,6 @@ if __name__ == "__main__":
             url=base_url + endpoint.path,
             expected_duration=args.duration,
             body=endpoint.body,
+            debug=args.debug,
         )
         benchmark.run_test()
