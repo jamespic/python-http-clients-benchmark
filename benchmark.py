@@ -588,7 +588,7 @@ class PyCurlBenchmark(AsyncioBenchmark):
 
     def _handle_timeout(self) -> None:
         """Called by IOLoop when the requested timeout has passed."""
-        self._timeout = None
+        self._timeout_handle = None
         self._multi.socket_action(pycurl.SOCKET_TIMEOUT, 0)
         self._loop.call_soon(self._finish_pending_requests)
 
