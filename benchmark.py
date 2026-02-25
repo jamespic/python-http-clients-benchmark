@@ -172,7 +172,7 @@ class BaseBenchmark:
                     )
                     break
                 else:
-                    self._record_delay(test_start_time + start_time, -delay)
+                    self._record_delay(start_time, -delay)
                     await self.sleep(0)
                 self.spawn_request(start_time)
 
@@ -190,7 +190,7 @@ class BaseBenchmark:
             self._record_failure(
                 timestamp, e, latency=perf_counter() - start_perf_counter
             )
-        finally:
+        else:
             end_perf_counter = perf_counter()
             latency = end_perf_counter - start_perf_counter
             self._record_result(timestamp, latency)
@@ -316,6 +316,8 @@ class HttpxBenchmark(BaseBenchmark):
         except httpx.HTTPStatusError:
             # 404 is the only status we expect in the test, everything else is an error
             assert response.status_code == 404
+        else:
+            assert response.status_code == 200
         await response.aread()
         if response.headers["Content-Type"] == "application/json":
             response.json()
@@ -393,6 +395,7 @@ class PyreqwestBenchmark(AsyncioBenchmark):
             assert e.details["status"] == 404
             return
         else:
+            assert response.status == 200
             if response.get_header("Content-Type") == "application/json":
                 await response.json()
             else:
@@ -424,6 +427,8 @@ class AiohttpBenchmark(AsyncioBenchmark):
             except aiohttp.ClientResponseError as e:
                 # 404 is the only status we expect in the test, everything else is an error
                 assert e.status == 404
+            else:
+                assert response.status == 200
             if response.headers["Content-Type"] == "application/json":
                 await response.json()
             else:
@@ -453,10 +458,12 @@ class NiquestsBenchmark(AsyncioBenchmark):
             # 404 is the only status we expect in the test, everything else is an error
             assert e.response is not None
             assert e.response.status_code == 404
+        else:
+            assert response.status_code == 200
         if response.headers["Content-Type"] == "application/json":
             await response.json()
         else:
-            await response.read()
+            await response.content
 
 
 class NiquestsUvloopBenchmark(NiquestsBenchmark, UvloopBenchmark):
