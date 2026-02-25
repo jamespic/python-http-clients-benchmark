@@ -637,7 +637,7 @@ class PyCurlBenchmark(AsyncioBenchmark):
         try:
             await future
             assert curl.getinfo(pycurl.RESPONSE_CODE) in (200, 404)
-            if headers.get("Content-Type") == "application/json":
+            if headers.get("content-type") == "application/json":
                 assert response is not None
                 orjson.loads(response)
         finally:
