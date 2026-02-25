@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import resource
 import ssl
 import subprocess
 import sys
@@ -132,6 +133,9 @@ class Stats:
             f"Delays: {self.delays}",
             file=sys.stderr,
         )
+
+
+MAX_CONNECTION_POOL_SIZE = 2000
 
 
 class BaseBenchmark:
@@ -310,7 +314,11 @@ class HttpxBenchmark(BaseBenchmark):
 
     async def make_client(self) -> httpx.AsyncClient:
         return await self.exit_stack.enter_async_context(
-            httpx.AsyncClient(verify=ssl_context, timeout=self._timeout)
+            httpx.AsyncClient(
+                verify=ssl_context,
+                timeout=self._timeout,
+                limits=httpx.Limits(max_connections=MAX_CONNECTION_POOL_SIZE),
+            )
         )
 
     async def make_request(self):
@@ -348,6 +356,7 @@ class HttpxPyreqwestBenchmark(HttpxBenchmark, AsyncioBenchmark):
             pyreqwest.client.ClientBuilder()
             .add_root_certificate_pem(server_ca_cert_pem)
             .timeout(datetime.timedelta(seconds=self._timeout))
+            .max_connections(MAX_CONNECTION_POOL_SIZE)
             .build()
         )
         return await self.exit_stack.enter_async_context(
@@ -365,7 +374,11 @@ class HttpxPyreqwestUvloopBenchmark(HttpxPyreqwestBenchmark, UvloopBenchmark):
 class AiohttpHttpxTransportBenchmark(HttpxBenchmark, AsyncioBenchmark):
     async def make_client(self):
         return await self.exit_stack.enter_async_context(
-            httpx_aiohttp.HttpxAiohttpClient(verify=ssl_context, timeout=self._timeout)
+            httpx_aiohttp.HttpxAiohttpClient(
+                verify=ssl_context,
+                timeout=self._timeout,
+                limits=httpx.Limits(max_connections=MAX_CONNECTION_POOL_SIZE),
+            )
         )
 
 
@@ -381,6 +394,7 @@ class PyreqwestBenchmark(AsyncioBenchmark):
             pyreqwest.client.ClientBuilder()
             .add_root_certificate_pem(server_ca_cert_pem)
             .timeout(datetime.timedelta(seconds=self._timeout))
+            .max_connections(MAX_CONNECTION_POOL_SIZE)
             .error_for_status(True)
             .build()
         )
@@ -417,7 +431,9 @@ class AiohttpBenchmark(AsyncioBenchmark):
     async def setUp(self):
         self._client = await self.exit_stack.enter_async_context(
             aiohttp.ClientSession(
-                connector=aiohttp.TCPConnector(ssl=ssl_context),
+                connector=aiohttp.TCPConnector(
+                    ssl=ssl_context, limit=MAX_CONNECTION_POOL_SIZE
+                ),
                 timeout=aiohttp.ClientTimeout(total=self._timeout),
             )
         )
@@ -449,7 +465,9 @@ class AiohttpUvloopBenchmark(AiohttpBenchmark, UvloopBenchmark):
 class NiquestsBenchmark(AsyncioBenchmark):
     async def setUp(self):
         self._client = await self.exit_stack.enter_async_context(
-            niquests.AsyncSession(timeout=self._timeout)
+            niquests.AsyncSession(
+                timeout=self._timeout, pool_maxsize=MAX_CONNECTION_POOL_SIZE
+            )
         )
         self._client.verify = server_ca_cert_location
         await super().setUp()
@@ -603,6 +621,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    resource.setrlimit(resource.RLIMIT_NOFILE, (100000, 100000))
     with run_server(args.server_type) as base_url:
         endpoint = ENDPOINTS[args.endpoint]
         test_class = TEST_CLASSES[args.test_class]

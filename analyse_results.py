@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from os.path import basename, splitext
-from typing import TypedDict, cast
+from typing import Callable, TypedDict, cast
 
 import numpy as np
 import pygal
@@ -121,9 +121,9 @@ def read_and_bin_data(filename: str, bin_size: float = 1.0) -> BenchmarkResult:
 
 
 class PerBenchmarkGraphs(TypedDict):
-    success_failure: pygal.Line
-    average_latency: pygal.Line
-    latency_percentiles: pygal.Line
+    success_failure: pygal.TimeDeltaLine
+    average_latency: pygal.TimeDeltaLine
+    latency_percentiles: pygal.TimeDeltaLine
 
 
 def get_time_bins(benchmark_results: Iterable[BenchmarkResult]) -> list[float]:
@@ -152,49 +152,82 @@ def get_time_bins(benchmark_results: Iterable[BenchmarkResult]) -> list[float]:
     return filtered_bins
 
 
+def get_test_end_time(benchmark_results: Iterable[BenchmarkResult]) -> float:
+    bins = sorted(
+        set(
+            result.time_bin
+            for benchmark_result in benchmark_results
+            for result in benchmark_result.binned_results
+        )
+    )
+    # A few tests seem to run over, with weird sparse data at the end. Remove any bins more than 5 steps past the previous bin
+    last_step = None
+    last_bin = None
+    for bin_ in bins:
+        if (
+            last_step is not None
+            and last_bin is not None
+            and bin_ - last_bin > 5 * last_step
+        ):
+            return last_bin
+        if last_bin is not None:
+            last_step = bin_ - last_bin
+        last_bin = bin_
+    return last_bin if last_bin is not None else 0.0
+
+
 def produce_per_benchmark_graphs(
     benchmark_result: BenchmarkResult,
 ) -> PerBenchmarkGraphs:
-    time_bins = get_time_bins([benchmark_result])
-    success_counts = [
-        result.success_count for result in benchmark_result.binned_results
-    ]
-    failure_counts = [
-        result.failure_count for result in benchmark_result.binned_results
-    ]
-    average_latencies = [
-        {
-            "value": result.average_latency,
-            "ci": {
-                "type": "continuous",
-                "stddev": result.standard_deviation_latency,
-                "sample_size": result.success_count,
-            },
-        }
+    end_time = get_test_end_time([benchmark_result])
+    truncated_binned_results = [
+        result
         for result in benchmark_result.binned_results
+        if result.time_bin <= end_time
     ]
-    latency_percentiles = {
-        p: [result.latency_percentiles[p] for result in benchmark_result.binned_results]
-        for p in PERCENTILES
-    }
-    delay_counts = [result.delay_count for result in benchmark_result.binned_results]
 
-    success_failure_graph = pygal.Line(title="Success and Failure Counts Over Time")
-    success_failure_graph.x_labels = time_bins
-    success_failure_graph.add("Successes", success_counts)
-    success_failure_graph.add("Failures", failure_counts)
-    success_failure_graph.add("Delays", delay_counts)
-
-    latency_graph = pygal.Line(title="Average Latency Over Time", logarithmic=True)
-    latency_graph.x_labels = time_bins
-    latency_graph.add("Average Latency", average_latencies)
-
-    percentile_graph = pygal.Line(
-        title="Percentile Latency Over Time", logarithmic=True
+    success_failure_graph = pygal.TimeDeltaLine(
+        title="Success and Failure Counts Over Time"
     )
-    percentile_graph.x_labels = time_bins
+
+    success_failure_graph.add(
+        "Successes",
+        [
+            (result.time_bin, result.success_count)
+            for result in truncated_binned_results
+        ],
+    )
+    success_failure_graph.add(
+        "Failures",
+        [
+            (result.time_bin, result.failure_count)
+            for result in truncated_binned_results
+        ],
+    )
+    success_failure_graph.add(
+        "Delays",
+        [(result.time_bin, result.delay_count) for result in truncated_binned_results],
+    )
+
+    latency_graph = pygal.TimeDeltaLine(title="Average Latency Over Time")
+    latency_graph.add(
+        "Average Latency",
+        [
+            (result.time_bin, result.average_latency)
+            for result in truncated_binned_results
+        ],
+    )
+
+    percentile_graph = pygal.TimeDeltaLine(title="Percentile Latency Over Time")
+
     for p in PERCENTILES:
-        percentile_graph.add(f"{p}th Percentile Latency", latency_percentiles[p])
+        percentile_graph.add(
+            f"{p}th Percentile Latency",
+            [
+                (result.time_bin, result.latency_percentiles[p])
+                for result in truncated_binned_results
+            ],
+        )
 
     return {
         "success_failure": success_failure_graph,
@@ -214,133 +247,101 @@ def save_per_benchmark_graphs(benchmark_result: BenchmarkResult) -> None:
 
 
 class PerServerEndpointGraphs(TypedDict):
-    throughput: pygal.Line
-    average_latency: pygal.Line
-    p90_latency: pygal.Line
-    p99_latency: pygal.Line
+    throughput: pygal.TimeDeltaLine
+    average_latency: pygal.TimeDeltaLine
+    p90_latency: pygal.TimeDeltaLine
+    p99_latency: pygal.TimeDeltaLine
 
 
 def produce_per_server_endpoint_graphs(
+    server: str,
+    endpoint: str,
     benchmark_results: Iterable[BenchmarkResult],
 ) -> PerServerEndpointGraphs:
-    time_bins = get_time_bins(benchmark_results)
-    throughput_series: defaultdict[str, dict[float, float]] = defaultdict(
-        lambda: defaultdict(float)
-    )
-    average_latency_series: defaultdict[str, dict[float, float]] = defaultdict(
-        lambda: defaultdict(float)
-    )
-    p90_latency_series: defaultdict[str, dict[float, float]] = defaultdict(
-        lambda: defaultdict(float)
-    )
-    p99_latency_series: defaultdict[str, dict[float, float]] = defaultdict(
-        lambda: defaultdict(float)
-    )
-    for benchmark_result in benchmark_results:
-        for binned_result in benchmark_result.binned_results:
-            throughput_series[benchmark_result.client_under_test][
-                binned_result.time_bin
-            ] = binned_result.throughput
-            average_latency_series[benchmark_result.client_under_test][
-                binned_result.time_bin
-            ] = binned_result.average_latency
-            p90_latency_series[benchmark_result.client_under_test][
-                binned_result.time_bin
-            ] = binned_result.latency_percentiles[90]
-            p99_latency_series[benchmark_result.client_under_test][
-                binned_result.time_bin
-            ] = binned_result.latency_percentiles[99]
+    end_time = get_test_end_time(benchmark_results)
 
-    throughput_graph = pygal.Line(title="Throughput Over Time")
-    throughput_graph.x_labels = time_bins
-    for client_under_test, series in throughput_series.items():
-        throughput_graph.add(
-            client_under_test, [series.get(time_bin, None) for time_bin in time_bins]
-        )
-
-    average_latency_graph = pygal.Line(
-        title="Average Latency Over Time", logarithmic=True
-    )
-    average_latency_graph.x_labels = time_bins
-    for client_under_test, series in average_latency_series.items():
-        average_latency_graph.add(
-            client_under_test, [series.get(time_bin, None) for time_bin in time_bins]
-        )
-
-    p90_latency_graph = pygal.Line(
-        title="90th Percentile Latency Over Time", logarithmic=True
-    )
-    p90_latency_graph.x_labels = time_bins
-    for client_under_test, series in p90_latency_series.items():
-        p90_latency_graph.add(
-            client_under_test, [series.get(time_bin, None) for time_bin in time_bins]
-        )
-
-    p99_latency_graph = pygal.Line(
-        title="99th Percentile Latency Over Time", logarithmic=True
-    )
-    p99_latency_graph.x_labels = time_bins
-    for client_under_test, series in p99_latency_series.items():
-        p99_latency_graph.add(
-            client_under_test, [series.get(time_bin, None) for time_bin in time_bins]
-        )
+    def _make_graph(
+        title: str, value_extractor: Callable[[BinnedResult], float]
+    ) -> pygal.TimeDeltaLine:
+        graph = pygal.TimeDeltaLine(title=title)
+        for benchmark_result in sorted(
+            benchmark_results, key=lambda r: r.client_under_test
+        ):
+            graph.add(
+                benchmark_result.client_under_test,
+                [
+                    (result.time_bin, value_extractor(result))
+                    for result in benchmark_result.binned_results
+                    if result.time_bin <= end_time
+                ],
+            )
+        return graph
 
     return {
-        "throughput": throughput_graph,
-        "average_latency": average_latency_graph,
-        "p90_latency": p90_latency_graph,
-        "p99_latency": p99_latency_graph,
+        "throughput": _make_graph(
+            "Throughput Over Time", lambda result: result.throughput
+        ),
+        "average_latency": _make_graph(
+            "Average Latency Over Time",
+            lambda result: result.average_latency,
+        ),
+        "p90_latency": _make_graph(
+            "90th Percentile Latency Over Time",
+            lambda result: result.latency_percentiles[90],
+        ),
+        "p99_latency": _make_graph(
+            "99th Percentile Latency Over Time",
+            lambda result: result.latency_percentiles[99],
+        ),
     }
 
 
-class OverallGraphs(TypedDict):
+class PerServerTypeGraphs(TypedDict):
     breaking_point: pygal.Bar
     max_throughput: pygal.Bar
 
 
-def produce_overall_graphs(
+def produce_per_server_type_graphs(
     benchmark_results: Iterable[BenchmarkResult],
-) -> OverallGraphs:
-    x_labels = set(
-        _server_and_endpoint_description(result) for result in benchmark_results
-    )
-    breaking_point_series: defaultdict[str, defaultdict[str, float]] = defaultdict(
-        lambda: defaultdict(float)
-    )
-    max_throughput_series: defaultdict[str, defaultdict[str, float]] = defaultdict(
-        lambda: defaultdict(float)
-    )
-    for result in benchmark_results:
-        breaking_point_series[result.client_under_test][
-            _server_and_endpoint_description(result)
-        ] = result.breaking_point
-        max_throughput_series[result.client_under_test][
-            _server_and_endpoint_description(result)
-        ] = result.max_throughput
+) -> PerServerTypeGraphs:
+    results_by_client_and_endpoint = {
+        (result.client_under_test, result.endpoint): result
+        for result in benchmark_results
+    }
+    clients = sorted(set(result.client_under_test for result in benchmark_results))
+    endpoints = sorted(set(result.endpoint for result in benchmark_results))
 
-    breaking_point_graph = pygal.Bar(
-        title="Breaking Point (Throughput where failures breach 1%)", x_labels=x_labels
-    )
-    for client_under_test, series in breaking_point_series.items():
-        breaking_point_graph.add(
-            client_under_test, [series.get(label, None) for label in x_labels]
-        )
-    max_throughput_graph = pygal.Bar(
-        title="Maximum Throughput Achieved", x_labels=x_labels
-    )
-    for client_under_test, series in max_throughput_series.items():
-        max_throughput_graph.add(
-            client_under_test, [series.get(label, None) for label in x_labels]
-        )
+    def _make_graph(
+        title: str, value_extractor: Callable[[BenchmarkResult], float]
+    ) -> pygal.Bar:
+        graph = pygal.Bar(title=title, x_labels=endpoints)
+        for client in clients:
+            graph.add(
+                client,
+                [
+                    (
+                        value_extractor(result)
+                        if (
+                            result := results_by_client_and_endpoint.get(
+                                (client, endpoint)
+                            )
+                        )
+                        else 0.0
+                    )
+                    for endpoint in endpoints
+                ],
+            )
+        return graph
 
     return {
-        "breaking_point": breaking_point_graph,
-        "max_throughput": max_throughput_graph,
+        "breaking_point": _make_graph(
+            "Breaking Point (Throughput where failures breach 5%)",
+            lambda result: result.breaking_point,
+        ),
+        "max_throughput": _make_graph(
+            "Maximum Throughput Achieved", lambda result: result.max_throughput
+        ),
     }
-
-
-def _server_and_endpoint_description(result: BenchmarkResult) -> str:
-    return f"{result.endpoint}_{result.server_type}"
 
 
 def write_report(
@@ -393,6 +394,15 @@ def write_report(
             with tag("h2"):
                 w(f"Server Type: {server_type}")
 
+            with tag("p"):
+                w(
+                    f"<object data='graphs/{server_type}_breaking_point.svg' width='800' height='600' type='image/svg+xml'></object>"
+                )
+            with tag("p"):
+                w(
+                    f"<object data='graphs/{server_type}_max_throughput.svg' width='800' height='600' type='image/svg+xml'></object>"
+                )
+
             with tag("table", border="1", cellspacing="0", cellpadding="5"):
                 with tag("tr"):
                     w("<th>Client Under Test</th>")
@@ -405,22 +415,16 @@ def write_report(
                         for endpoint in endpoints:
                             with tag("td"):
                                 with tag("ul"):
-                                    with tag("li"):
-                                        w(
-                                            f'<a href="graphs/{endpoint}_{server_type}_throughput.svg">Throughput</a>'
-                                        )
-                                    with tag("li"):
-                                        w(
-                                            f'<a href="graphs/{endpoint}_{server_type}_average_latency.svg">Average Latency</a>'
-                                        )
-                                    with tag("li"):
-                                        w(
-                                            f'<a href="graphs/{endpoint}_{server_type}_p90_latency.svg">P90 Latency</a>'
-                                        )
-                                    with tag("li"):
-                                        w(
-                                            f'<a href="graphs/{endpoint}_{server_type}_p99_latency.svg">P99 Latency</a>'
-                                        )
+                                    for x in [
+                                        "throughput",
+                                        "average_latency",
+                                        "p90_latency",
+                                        "p99_latency",
+                                    ]:
+                                        with tag("li"):
+                                            w(
+                                                f'<a href="graphs/{endpoint}_{server_type}_{x}.svg">{x.replace("_", " ").title()}</a>'
+                                            )
                     for client_under_test in clients_under_test:
                         with tag("tr"):
                             w(f"<td>{client_under_test}</td>")
@@ -511,7 +515,7 @@ def choose_colour_bad_to_good(value: float) -> str:
 
 def main():
     with ThreadPoolExecutor() as executor:
-        benchmark_results = list(
+        benchmark_results: list[BenchmarkResult] = list(
             executor.map(
                 lambda filename: read_and_bin_data(f"results/{filename}"),
                 [
@@ -521,22 +525,30 @@ def main():
                 ],
             )
         )
-        executor.map(save_per_benchmark_graphs, benchmark_results)
+        list(executor.map(save_per_benchmark_graphs, benchmark_results))
 
-    grouped_by_server_endpoint = defaultdict[str, list[BenchmarkResult]](list)
-    for result in benchmark_results:
-        grouped_by_server_endpoint[_server_and_endpoint_description(result)].append(
-            result
-        )
-    for server_endpoint, group in grouped_by_server_endpoint.items():
-        graphs = cast(dict[str, pygal.Graph], produce_per_server_endpoint_graphs(group))
-        for graph_name, graph in graphs.items():
-            graph.render_to_file(f"graphs/{server_endpoint}_{graph_name}.svg")
-    overall_graphs = cast(
-        dict[str, pygal.Graph], produce_overall_graphs(benchmark_results)
+    grouped_by_server_endpoint = defaultdict[tuple[str, str], list[BenchmarkResult]](
+        list
     )
-    for graph_name, graph in overall_graphs.items():
-        graph.render_to_file(f"graphs/overall_{graph_name}.svg")
+    for result in benchmark_results:
+        grouped_by_server_endpoint[(result.server_type, result.endpoint)].append(result)
+    for (server, endpoint), group in grouped_by_server_endpoint.items():
+        graphs = cast(
+            dict[str, pygal.Graph],
+            produce_per_server_endpoint_graphs(server, endpoint, group),
+        )
+        for graph_name, graph in graphs.items():
+            graph.render_to_file(f"graphs/{endpoint}_{server}_{graph_name}.svg")
+
+    grouped_by_server_type = defaultdict[str, list[BenchmarkResult]](list)
+    for result in benchmark_results:
+        grouped_by_server_type[result.server_type].append(result)
+    for server_type, group in grouped_by_server_type.items():
+        overall_graphs = cast(
+            dict[str, pygal.Graph], produce_per_server_type_graphs(group)
+        )
+        for graph_name, graph in overall_graphs.items():
+            graph.render_to_file(f"graphs/{server_type}_{graph_name}.svg")
     write_report(benchmark_results)
 
 
