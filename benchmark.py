@@ -5,10 +5,10 @@ import ssl
 import subprocess
 import sys
 import time
-import traceback
 from contextlib import AsyncExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from enum import StrEnum
+from logging import DEBUG, INFO, basicConfig, getLogger
 from math import sqrt
 from random import expovariate
 from time import monotonic, perf_counter
@@ -160,6 +160,7 @@ class BaseBenchmark:
         self._overall_stats = Stats()
         self._current_stats = Stats()
         self._debug = debug
+        self._logger = getLogger(self.__class__.__name__)
 
     async def make_request(self):
         raise NotImplementedError("Subclasses must implement make_request")
@@ -239,9 +240,7 @@ class BaseBenchmark:
         self._maybe_print_stats()
         self._current_stats.record_failure(latency)
         if self._debug:
-            traceback.print_exception(
-                type(error), error, error.__traceback__, file=sys.stderr
-            )
+            self._logger.exception(f"Request failed with error: {error}")
 
     def _record_delay(self, start_time_monotonic: float, delay: float):
         self._output_file.write(f"delay,{start_time_monotonic},{delay}\n")
@@ -361,6 +360,7 @@ class HttpxPyreqwestBenchmark(HttpxBenchmark, AsyncioBenchmark):
             .timeout(datetime.timedelta(seconds=self._timeout))
             .max_connections(MAX_CONNECTION_POOL_SIZE)
             .http2(True)
+            .http2_adaptive_window(True)
             .build()
         )
         return await self.exit_stack.enter_async_context(
@@ -400,6 +400,8 @@ class PyreqwestBenchmark(AsyncioBenchmark):
             .timeout(datetime.timedelta(seconds=self._timeout))
             .max_connections(MAX_CONNECTION_POOL_SIZE)
             .http2(True)
+            .http2_adaptive_window(True)
+            .connection_verbose(True)
             .error_for_status(True)
             .build()
         )
@@ -680,33 +682,55 @@ class ServerTypes(StrEnum):
 WORKERS = 4
 
 
+class AsgiServer(StrEnum):
+    GRANIAN = "granian"
+    HYPERCORN = "hypercorn"
+
+
 @contextmanager
-def run_server(type_: ServerTypes = ServerTypes.HTTPS2):
-    cmd = [
-        "granian",
-        "server:app",
-        "--interface",
-        "asginl",
-        "--workers",
-        f"{WORKERS}",
-    ]
-    ssl_opts = [
-        "--ssl-keyfile",
-        "server.key",
-        "--ssl-certificate",
-        "server.crt",
-        "--port",
-        "8443",
-    ]
-    base_url = "https://localhost:8443"
-    match type_:
-        case "https2":
-            cmd += ssl_opts
-        case "https1":
-            cmd += ssl_opts + ["--http", "1"]
-        case "http1":
-            cmd += ["--port", "8000", "--http", "1"]
-            base_url = "http://localhost:8000"
+def run_server(
+    type_: ServerTypes = ServerTypes.HTTPS2,
+    asgi_server: AsgiServer = AsgiServer.GRANIAN,
+) -> Iterator[str]:
+    match asgi_server:
+        case AsgiServer.GRANIAN:
+            cmd = [
+                "granian",
+                "server:app",
+                "--interface",
+                "asginl",
+                "--workers",
+                f"{WORKERS}",
+            ]
+            ssl_opts = [
+                "--ssl-keyfile",
+                "server.key",
+                "--ssl-certificate",
+                "server.crt",
+                "--port",
+                "8443",
+            ]
+            base_url = "https://localhost:8443"
+            match type_:
+                case "https2":
+                    cmd += ssl_opts
+                case "https1":
+                    cmd += ssl_opts + ["--http", "1"]
+                case "http1":
+                    cmd += ["--port", "8000", "--http", "1"]
+                    base_url = "http://localhost:8000"
+        case AsgiServer.HYPERCORN:
+            cmd = [
+                "hypercorn",
+                "--config",
+                f"hypercorn_config/{type_}.toml",
+                "asgi:server:app",
+            ]
+            base_url = (
+                "https://localhost:8000"
+                if type_ == "http1"
+                else "https://localhost:8443"
+            )
     with open("results/server.log", "wb") as log_file:
         process = subprocess.Popen(cmd, stdout=log_file, stderr=log_file)
         for _ in range(10):
@@ -778,10 +802,29 @@ if __name__ == "__main__":
     parser.add_argument(
         "--debug", action="store_true", help="Print debug information during the test"
     )
+    parser.add_argument(
+        "--no-logging",
+        dest="enable_logging",
+        action="store_false",
+        help="Disable writing logs to files",
+    )
+    parser.add_argument(
+        "--asgi-server",
+        type=AsgiServer,
+        choices=list(AsgiServer),
+        default=AsgiServer.GRANIAN,
+        help="ASGI server to use for the test",
+    )
     args = parser.parse_args()
 
+    if args.enable_logging or args.debug:
+        basicConfig(
+            filename=f"results/{args.test_class}_{args.endpoint}_{args.server_type}.log",
+            level=DEBUG if args.debug else INFO,
+        )
+
     resource.setrlimit(resource.RLIMIT_NOFILE, (100000, 100000))
-    with run_server(args.server_type) as base_url:
+    with run_server(args.server_type, args.asgi_server) as base_url:
         endpoint = ENDPOINTS[args.endpoint]
         test_class = TEST_CLASSES[args.test_class]
         benchmark = test_class(

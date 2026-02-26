@@ -1,3 +1,5 @@
+import re
+import argparse
 import os
 from collections import Counter, defaultdict
 from collections.abc import Generator, Iterable
@@ -37,7 +39,12 @@ class BenchmarkResult:
     client_under_test: str
     binned_results: list[BinnedResult]
     top_failure_messages: dict[str, int]
-    overall_average_latency: float
+    def latency_at_rps(self, rps: float) -> float:
+        for result in self.binned_results:
+            if result.throughput >= rps:
+                return result.average_latency
+        else:
+            return max((result.average_latency for result in self.binned_results), default=10.0)
 
     @property
     def max_throughput(self) -> float:
@@ -45,14 +52,11 @@ class BenchmarkResult:
 
     @property
     def breaking_point(self) -> float:
-        return min(
-            (
-                result.throughput
-                for result in self.binned_results
-                if result.failure_count > 0.05 * result.success_count
-            ),
-            default=self.max_throughput,
-        )
+        for result in self.binned_results:
+                if result.failure_count > 0.05 * result.success_count:
+                    return result.throughput
+        else:
+            return self.max_throughput
 
 
 def read_and_bin_data(filename: str, bin_size: float = 1.0) -> BenchmarkResult:
@@ -63,18 +67,14 @@ def read_and_bin_data(filename: str, bin_size: float = 1.0) -> BenchmarkResult:
     failures_by_time = Counter[float]()
     failures_by_message = Counter[str]()
     delay_counts = Counter[float]()
-    total_success_latency = 0.0
-    total_successes_count = 0
     with open(filename, "r") as file_:
         for row in file_:
             type_, timestamp, data = row.strip().split(",", 2)
-            time_bin = int(float(timestamp) // bin_size)
+            time_bin = int(float(timestamp) // bin_size) * bin_size
             match type_:
                 case "success":
                     latency = float(data)
                     successes[time_bin].append(latency)
-                    total_success_latency += latency
-                    total_successes_count += 1
                 case "failure":
                     failures_by_time[time_bin] += 1
                     failures_by_message[data] += 1
@@ -112,11 +112,6 @@ def read_and_bin_data(filename: str, bin_size: float = 1.0) -> BenchmarkResult:
         client_under_test=client_under_test,
         binned_results=binned_results,
         top_failure_messages=dict(failures_by_message.most_common(10)),
-        overall_average_latency=(
-            total_success_latency / total_successes_count
-            if total_successes_count > 0
-            else 0.0
-        ),
     )
 
 
@@ -345,7 +340,7 @@ def produce_per_server_type_graphs(
 
 
 def write_report(
-    benchmark_results: Iterable[BenchmarkResult], filename: str = "report.html"
+    benchmark_results: Iterable[BenchmarkResult], filename: str = "report.html", rps_for_latency: float = 500.0
 ) -> None:
     with open(filename, "w") as file_:
         indent = 0
@@ -376,20 +371,20 @@ def write_report(
         }
         for server_type in server_types:
             max_max_throughputs = defaultdict[str, float](float)
-            min_overall_latencies = defaultdict[str, float](lambda: float("inf"))
-            max_overall_latencies = defaultdict[str, float](float)
+            min_latencies_at_rps = defaultdict[str, float](lambda: float("inf"))
+            max_latencies_at_rps = defaultdict[str, float](float)
             for result in benchmark_results:
                 if result.server_type == server_type:
                     max_max_throughputs[result.endpoint] = max(
                         max_max_throughputs[result.endpoint], result.max_throughput
                     )
-                    min_overall_latencies[result.endpoint] = min(
-                        min_overall_latencies[result.endpoint],
-                        result.overall_average_latency,
+                    min_latencies_at_rps[result.endpoint] = min(
+                        min_latencies_at_rps[result.endpoint],
+                        result.latency_at_rps(rps_for_latency),
                     )
-                    max_overall_latencies[result.endpoint] = max(
-                        max_overall_latencies[result.endpoint],
-                        result.overall_average_latency,
+                    max_latencies_at_rps[result.endpoint] = max(
+                        max_latencies_at_rps[result.endpoint],
+                        result.latency_at_rps(rps_for_latency),
                     )
             with tag("h2"):
                 w(f"Server Type: {server_type}")
@@ -430,8 +425,8 @@ def write_report(
                             w(f"<td>{client_under_test}</td>")
                             for endpoint in endpoints:
                                 endpoint_max_throughput = max_max_throughputs[endpoint]
-                                min_overall_latency = min_overall_latencies[endpoint]
-                                max_overall_latency = max_overall_latencies[endpoint]
+                                min_latency_at_rps = min_latencies_at_rps[endpoint]
+                                max_latency_at_rps = max_latencies_at_rps[endpoint]
                                 result = results_lookup.get(
                                     (server_type, endpoint, client_under_test)
                                 )
@@ -452,12 +447,13 @@ def write_report(
                                                 w(
                                                     f"Max Throughput: {result.max_throughput:.2f} rps"
                                                 )
+                                            latency_at_rps = result.latency_at_rps(rps_for_latency)
                                             with tag(
                                                 "li",
-                                                style=f"color: {choose_colour_bad_to_good(1 - (result.overall_average_latency - min_overall_latency) / (max_overall_latency - min_overall_latency) if max_overall_latency > min_overall_latency else 0.0)}",
+                                                style=f"color: {choose_colour_bad_to_good(1 - (latency_at_rps - min_latency_at_rps) / (max_latency_at_rps - min_latency_at_rps) if max_latency_at_rps > min_latency_at_rps else 0.0)}",
                                             ):
                                                 w(
-                                                    f"Overall Average Latency: {result.overall_average_latency:.3f} s"
+                                                    f"Latency at {rps_for_latency} rps: {latency_at_rps:.3f} s"
                                                 )
                                             with tag("li"):
                                                 with tag(
@@ -513,11 +509,11 @@ def choose_colour_bad_to_good(value: float) -> str:
     return f"rgb({red}, {green}, 0)"
 
 
-def main():
+def main(bin_size: float = 1.0) -> None:
     with ThreadPoolExecutor() as executor:
         benchmark_results: list[BenchmarkResult] = list(
             executor.map(
-                lambda filename: read_and_bin_data(f"results/{filename}"),
+                lambda filename: read_and_bin_data(f"results/{filename}", bin_size),
                 [
                     filename
                     for filename in os.listdir("results")
@@ -553,4 +549,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--bin-size", type=float, default=1.0, help="Bin size for data aggregation")
+    args = parser.parse_args()
+
+    main(bin_size=args.bin_size)
