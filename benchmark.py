@@ -271,7 +271,7 @@ class AsyncioBenchmark(BaseBenchmark):
         self._task_group.create_task(self._do_one_request(timestamp))
 
     async def _do_request_with_timeout(self):
-        async with asyncio.timeout(10):
+        async with asyncio.timeout(self._timeout + 5):
             await self.make_request()
 
     def run_test(self):
@@ -298,7 +298,7 @@ class TrioBenchmark(BaseBenchmark):
         self._nursery.start_soon(self._do_one_request, timestamp)
 
     async def _do_request_with_timeout(self):
-        with trio.fail_after(self._timeout):
+        with trio.fail_after(self._timeout + 5):
             await self.make_request()
 
     def run_test(self):
@@ -401,7 +401,6 @@ class PyreqwestBenchmark(AsyncioBenchmark):
             .max_connections(MAX_CONNECTION_POOL_SIZE)
             .http2(True)
             .http2_adaptive_window(True)
-            .connection_verbose(True)
             .error_for_status(True)
             .build()
         )
