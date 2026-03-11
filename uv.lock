@@ -277,6 +277,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "aiohttp" },
     { name = "granian" },
+    { name = "httpcore-ms" },
     { name = "httpx", extra = ["http2"] },
     { name = "httpx-aiohttp" },
     { name = "hypercorn" },
@@ -303,6 +304,7 @@ dev = [
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.13.3" },
     { name = "granian", specifier = ">=2.7.1" },
+    { name = "httpcore-ms", path = "httpcore_ms-1.0.9-py3-none-any.whl" },
     { name = "httpx", extras = ["http2"], specifier = ">=0.28.1" },
     { name = "httpx-aiohttp", specifier = ">=0.1.12" },
     { name = "hypercorn", specifier = ">=0.18.0" },
@@ -337,6 +339,29 @@ sdist = { url = "https://files.pythonhosted.org/packages/06/94/82699a10bca87a555
 wheels = [
     { url = "https://files.pythonhosted.org/packages/7e/f5/f66802a942d491edb555dd61e3a9961140fd64c90bce1eafd741609d334d/httpcore-1.0.9-py3-none-any.whl", hash = "sha256:2d400746a40668fc9dec9810239072b40b4484b640a8c38fd654a024c7a1bf55", size = 78784, upload-time = "2025-04-24T22:06:20.566Z" },
 ]
+
+[[package]]
+name = "httpcore-ms"
+version = "1.0.9"
+source = { path = "httpcore_ms-1.0.9-py3-none-any.whl" }
+dependencies = [
+    { name = "certifi" },
+    { name = "h11" },
+]
+wheels = [
+    { filename = "httpcore_ms-1.0.9-py3-none-any.whl", hash = "sha256:d0410854d41292f9186edaef6511b65692d1136848447799ae9d7fdad7987343" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "anyio", marker = "extra == 'asyncio'", specifier = ">=4.5.0,<5.0" },
+    { name = "certifi" },
+    { name = "h11", specifier = ">=0.16" },
+    { name = "h2", marker = "extra == 'http2'", specifier = ">=3,<5" },
+    { name = "socksio", marker = "extra == 'socks'", specifier = "==1.*" },
+    { name = "trio", marker = "extra == 'trio'", specifier = ">=0.22.0,<1.0" },
+]
+provides-extras = ["asyncio", "http2", "socks", "trio"]
 
 [[package]]
 name = "httpx"

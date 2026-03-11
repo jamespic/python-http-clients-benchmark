@@ -211,22 +211,22 @@ class BaseBenchmark:
     async def __aenter__(self):
         self.exit_stack = AsyncExitStack()
         await self.exit_stack.__aenter__()
-        await self.setUp()
+        await self.set_up_task_group()
+        await self.set_up_client()
         return self
+
+    async def set_up_task_group(self):
+        raise NotImplementedError("Subclasses must implement set_up_task_group")
+
+    async def set_up_client(self):
+        raise NotImplementedError("Subclasses must implement set_up_client")
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         self._flush_stats()
         print("Final stats:", file=sys.stderr)
         self._overall_stats.print_stats()
-        await self.tearDown()
         await self.exit_stack.__aexit__(exc_type, exc_val, exc_tb)
         self._output_file.close()
-
-    async def setUp(self):
-        pass
-
-    async def tearDown(self):
-        pass
 
     def _record_result(self, start_time_monotonic: float, latency: float):
         self._output_file.write(f"success,{start_time_monotonic},{latency}\n")
@@ -257,7 +257,7 @@ class BaseBenchmark:
 
 
 class AsyncioBenchmark(BaseBenchmark):
-    async def setUp(self):
+    async def set_up_task_group(self):
         self.exit_stack.enter_context(suppress(asyncio.TimeoutError))
         await self.exit_stack.enter_async_context(
             asyncio.timeout(self._expected_duration + self._timeout)
@@ -265,7 +265,6 @@ class AsyncioBenchmark(BaseBenchmark):
         self._task_group = await self.exit_stack.enter_async_context(
             asyncio.TaskGroup()
         )
-        await super().setUp()
 
     def spawn_request(self, timestamp: float):
         self._task_group.create_task(self._do_one_request(timestamp))
@@ -287,12 +286,11 @@ class UvloopBenchmark(AsyncioBenchmark):
 
 
 class TrioBenchmark(BaseBenchmark):
-    async def setUp(self):
+    async def set_up_task_group(self):
         self.exit_stack.enter_context(
             trio.move_on_after(self._expected_duration + self._timeout)
         )
         self._nursery = await self.exit_stack.enter_async_context(trio.open_nursery())
-        await super().setUp()
 
     def spawn_request(self, timestamp: float):
         self._nursery.start_soon(self._do_one_request, timestamp)
@@ -309,9 +307,8 @@ class TrioBenchmark(BaseBenchmark):
 
 
 class HttpxBenchmark(BaseBenchmark):
-    async def setUp(self):
+    async def set_up_client(self):
         self._client = await self.make_client()
-        await super().setUp()
 
     async def make_client(self) -> httpx.AsyncClient:
         return await self.exit_stack.enter_async_context(
@@ -349,6 +346,34 @@ class HttpxUvloopBenchmark(HttpxBenchmark, UvloopBenchmark):
 
 
 class HttpxTrioBenchmark(HttpxBenchmark, TrioBenchmark):
+    pass
+
+
+class HttpxMsBenchmark(HttpxBenchmark):
+    async def set_up_client(self):
+        import httpcore_ms
+
+        self.old_httpcore = sys.modules.get("httpcore")
+        sys.modules["httpcore"] = httpcore_ms
+        self.exit_stack.callback(self.un_monkey_patch_httpcore)
+        await super().set_up_client()
+
+    def un_monkey_patch_httpcore(self):
+        if self.old_httpcore:
+            sys.modules["httpcore"] = self.old_httpcore
+        else:
+            del sys.modules["httpcore"]
+
+
+class HttpxMsAsyncioBenchmark(HttpxMsBenchmark, AsyncioBenchmark):
+    pass
+
+
+class HttpxMsUvloopBenchmark(HttpxMsBenchmark, UvloopBenchmark):
+    pass
+
+
+class HttpxMsTrioBenchmark(HttpxMsBenchmark, TrioBenchmark):
     pass
 
 
@@ -393,7 +418,7 @@ class AiohttpHttpsTransportUvloopBenchmark(
 
 
 class PyreqwestBenchmark(AsyncioBenchmark):
-    async def setUp(self):
+    async def set_up_client(self):
         self._client = await self.exit_stack.enter_async_context(
             pyreqwest.client.ClientBuilder()
             .add_root_certificate_pem(server_ca_cert_pem)
@@ -404,7 +429,6 @@ class PyreqwestBenchmark(AsyncioBenchmark):
             .error_for_status(True)
             .build()
         )
-        await super().setUp()
 
     async def make_request(self):
         try:
@@ -434,7 +458,7 @@ class PyreqwestUvloopBenchmark(PyreqwestBenchmark, UvloopBenchmark):
 
 
 class AiohttpBenchmark(AsyncioBenchmark):
-    async def setUp(self):
+    async def set_up_client(self):
         self._client = await self.exit_stack.enter_async_context(
             aiohttp.ClientSession(
                 connector=aiohttp.TCPConnector(
@@ -443,7 +467,6 @@ class AiohttpBenchmark(AsyncioBenchmark):
                 timeout=aiohttp.ClientTimeout(total=self._timeout),
             )
         )
-        await super().setUp()
 
     async def make_request(self):
         if self._body is not None:
@@ -469,14 +492,13 @@ class AiohttpUvloopBenchmark(AiohttpBenchmark, UvloopBenchmark):
 
 
 class NiquestsBenchmark(AsyncioBenchmark):
-    async def setUp(self):
+    async def set_up_client(self):
         self._client = await self.exit_stack.enter_async_context(
             niquests.AsyncSession(
                 timeout=self._timeout, pool_maxsize=MAX_CONNECTION_POOL_SIZE
             )
         )
         self._client.verify = server_ca_cert_location
-        await super().setUp()
 
     async def make_request(self):
         if self._body is not None:
@@ -517,7 +539,7 @@ FD_STATES_DEFAULT = CurlFDState(read=False, write=False)
 
 
 class PyCurlBenchmark(AsyncioBenchmark):
-    async def setUp(self):
+    async def set_up_client(self):
         self._loop = asyncio.get_running_loop()
         self._multi = pycurl.CurlMulti()
         self._current_fd_states = {}
@@ -528,11 +550,11 @@ class PyCurlBenchmark(AsyncioBenchmark):
         self._curl_limit_remaining = MAX_CONNECTION_POOL_SIZE
         self._reuse_pool = asyncio.Queue(maxsize=MAX_CONNECTION_POOL_SIZE)
         self._stopped = False
-        await super().setUp()
+        self.exit_stack.push_async_callback(self._cleanup_curls)
 
-    async def tearDown(self):
+    async def _cleanup_curls(self):
         # Clean up all curl handles
-        await super().tearDown()
+        self._stopped = True
         for curl, future in self._in_flight_curls.items():
             curl.close()
             future.cancel()
@@ -540,7 +562,6 @@ class PyCurlBenchmark(AsyncioBenchmark):
             curl = await self._reuse_pool.get()
             curl.close()
         self._multi.close()
-        self._stopped = True
 
     def _set_timeout(self, msecs: int) -> None:
         """Called by libcurl to schedule a timeout."""
@@ -615,14 +636,11 @@ class PyCurlBenchmark(AsyncioBenchmark):
             curl.setopt(pycurl.HTTPHEADER, ["Content-Type: application/json"])
             curl.setopt(pycurl.POSTFIELDS, orjson.dumps(self._body))
 
-        response: bytes | None = None
+        response: bytearray = bytearray()
 
         def write_function(data):
             nonlocal response
-            if response is None:
-                response = data
-            else:
-                response += data
+            response += data
             return len(data)
 
         curl.setopt(pycurl.WRITEFUNCTION, write_function)
@@ -657,6 +675,9 @@ TEST_CLASSES = {
     "httpx_asyncio": HttpxAsyncioBenchmark,
     "httpx_uvloop": HttpxUvloopBenchmark,
     "httpx_trio": HttpxTrioBenchmark,
+    "httpx_ms_asyncio": HttpxMsAsyncioBenchmark,
+    "httpx_ms_uvloop": HttpxMsUvloopBenchmark,
+    "httpx_ms_trio": HttpxMsTrioBenchmark,
     "httpx_pyreqwest": HttpxPyreqwestBenchmark,
     "httpx_pyreqwest_uvloop": HttpxPyreqwestUvloopBenchmark,
     "httpx_aiohttp": AiohttpHttpxTransportBenchmark,
