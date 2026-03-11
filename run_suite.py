@@ -1,3 +1,4 @@
+import datetime
 from argparse import ArgumentParser
 from subprocess import run
 
@@ -29,6 +30,16 @@ if __name__ == "__main__":
         help="Stop the benchmark suite if any individual benchmark fails",
     )
     args = argparser.parse_args()
+
+    expected_duration = (
+        args.duration * len(ENDPOINTS) * len(ServerTypes) * len(TEST_CLASSES)
+    )
+    expected_completion_time = datetime.datetime.now() + datetime.timedelta(seconds=expected_duration)
+    print(
+        f"Running benchmark suite. Expected completion time: {expected_completion_time:%Y-%m-%d %H:%M:%S}"
+    )
+    print()
+
     for endpoint in ENDPOINTS:
         for server_type in ServerTypes:
             for test_class in TEST_CLASSES:

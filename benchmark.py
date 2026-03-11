@@ -222,10 +222,10 @@ class BaseBenchmark:
         raise NotImplementedError("Subclasses must implement set_up_client")
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.exit_stack.__aexit__(exc_type, exc_val, exc_tb)
         self._flush_stats()
         print("Final stats:", file=sys.stderr)
         self._overall_stats.print_stats()
-        await self.exit_stack.__aexit__(exc_type, exc_val, exc_tb)
         self._output_file.close()
 
     def _record_result(self, start_time_monotonic: float, latency: float):
@@ -260,7 +260,7 @@ class AsyncioBenchmark(BaseBenchmark):
     async def set_up_task_group(self):
         self.exit_stack.enter_context(suppress(asyncio.TimeoutError))
         await self.exit_stack.enter_async_context(
-            asyncio.timeout(self._expected_duration + self._timeout)
+            asyncio.timeout(self._expected_duration + 3 * self._timeout)
         )
         self._task_group = await self.exit_stack.enter_async_context(
             asyncio.TaskGroup()
@@ -270,7 +270,7 @@ class AsyncioBenchmark(BaseBenchmark):
         self._task_group.create_task(self._do_one_request(timestamp))
 
     async def _do_request_with_timeout(self):
-        async with asyncio.timeout(self._timeout + 5):
+        async with asyncio.timeout(2 * self._timeout):
             await self.make_request()
 
     def run_test(self):
@@ -288,7 +288,7 @@ class UvloopBenchmark(AsyncioBenchmark):
 class TrioBenchmark(BaseBenchmark):
     async def set_up_task_group(self):
         self.exit_stack.enter_context(
-            trio.move_on_after(self._expected_duration + self._timeout)
+            trio.move_on_after(self._expected_duration + 3 * self._timeout)
         )
         self._nursery = await self.exit_stack.enter_async_context(trio.open_nursery())
 
@@ -296,7 +296,7 @@ class TrioBenchmark(BaseBenchmark):
         self._nursery.start_soon(self._do_one_request, timestamp)
 
     async def _do_request_with_timeout(self):
-        with trio.fail_after(self._timeout + 5):
+        with trio.fail_after(2 * self._timeout):
             await self.make_request()
 
     def run_test(self):
@@ -783,7 +783,7 @@ ENDPOINTS = {
     "hello": Endpoint("/hello", None),
     "json": Endpoint("/json", None),
     "chunked": Endpoint("/chunked", None),
-    "post": Endpoint("/post", {f"key{i}": ["value"] * 20 for i in range(20)}),
+    "post": Endpoint("/post", {f"key{i}": ["value"] * 50 for i in range(50)}),
     "latency": Endpoint("/latency", None),
     "notfound": Endpoint("/notfound", None),
 }

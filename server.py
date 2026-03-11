@@ -65,7 +65,9 @@ async def handle_post(scope, receive, send):
     )
 
 
-dummy_json = json.dumps({f"key{i}": ["value"] * 20 for i in range(20)}).encode("utf-8")
+dummy_json = json.dumps({f"key{i}": ["value"] * 50 for i in range(50)}).encode(
+    "utf-8"
+)
 
 
 async def handle_json_response(scope, receive, send):
@@ -101,7 +103,7 @@ async def handle_chunked(scope, receive, send):
             ],
         }
     )
-    for _ in range(63):
+    for _ in range(1023):
         await send(
             {
                 "type": "http.response.body",
