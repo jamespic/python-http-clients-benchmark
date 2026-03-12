@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from logging import DEBUG, INFO, basicConfig, getLogger
 from math import sqrt
-from random import expovariate
+from random import Random
 from time import monotonic, perf_counter
 from typing import Iterator
 from urllib.request import urlopen
@@ -39,23 +39,23 @@ def poisson_process(duration: float, initial_rate: float, final_rate: float):
     m = (b - a) / duration  # transform to a slope, to keep the math simpler
     c = a
 
-    if m == 0:
-
-        def transform(u):
-            return u * duration
-    else:
-
-        def transform(u):
-            return (sqrt(c**2 + 2 * m * u) - c) / m
-
     for u in uniform_poisson_process(expected_arrivals):
-        yield transform(u)
+        if m == 0:
+            yield u * duration
+        else:
+            yield (sqrt(c**2 + 2 * m * u) - c) / m
+
+
+SEED = 12345
 
 
 def uniform_poisson_process(lambd):
+    rng = Random(
+        SEED
+    )  # Make the process deterministic, to ensure comparability between runs
     t = 0
     while True:
-        t += expovariate(lambd)
+        t += rng.expovariate(lambd)
         if t >= 1:
             break
         yield t
@@ -332,9 +332,10 @@ class HttpxBenchmark(BaseBenchmark):
             assert response.status_code == 404
         else:
             assert response.status_code == 200
-        await response.aread()
         if response.headers["Content-Type"] == "application/json":
             response.json()
+        else:
+            response.content
 
 
 class HttpxAsyncioBenchmark(HttpxBenchmark, AsyncioBenchmark):
@@ -502,9 +503,9 @@ class NiquestsBenchmark(AsyncioBenchmark):
 
     async def make_request(self):
         if self._body is not None:
-            response = await self._client.post(self._url, json=self._body, stream=True)
+            response = await self._client.post(self._url, json=self._body)
         else:
-            response = await self._client.get(self._url, stream=True)
+            response = await self._client.get(self._url)
         try:
             response.raise_for_status()
         except niquests.exceptions.RequestException as e:
@@ -514,9 +515,9 @@ class NiquestsBenchmark(AsyncioBenchmark):
         else:
             assert response.status_code == 200
         if response.headers["Content-Type"] == "application/json":
-            await response.json()
+            response.json()
         else:
-            await response.content
+            response.content
 
 
 class NiquestsUvloopBenchmark(NiquestsBenchmark, UvloopBenchmark):

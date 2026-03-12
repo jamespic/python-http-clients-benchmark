@@ -1,4 +1,3 @@
-import re
 import argparse
 import os
 from collections import Counter, defaultdict
@@ -39,12 +38,15 @@ class BenchmarkResult:
     client_under_test: str
     binned_results: list[BinnedResult]
     top_failure_messages: dict[str, int]
+
     def latency_at_rps(self, rps: float) -> float:
         for result in self.binned_results:
             if result.throughput >= rps:
                 return result.average_latency
         else:
-            return max((result.average_latency for result in self.binned_results), default=10.0)
+            return max(
+                (result.average_latency for result in self.binned_results), default=10.0
+            )
 
     @property
     def max_throughput(self) -> float:
@@ -53,8 +55,8 @@ class BenchmarkResult:
     @property
     def breaking_point(self) -> float:
         for result in self.binned_results:
-                if result.failure_count > 0.05 * result.success_count:
-                    return result.throughput
+            if result.failure_count > 0.05 * result.success_count:
+                return result.throughput
         else:
             return self.max_throughput
 
@@ -246,6 +248,7 @@ class PerServerEndpointGraphs(TypedDict):
     average_latency: pygal.TimeDeltaLine
     p90_latency: pygal.TimeDeltaLine
     p99_latency: pygal.TimeDeltaLine
+    p50_latency: pygal.TimeDeltaLine
 
 
 def produce_per_server_endpoint_graphs(
@@ -287,6 +290,10 @@ def produce_per_server_endpoint_graphs(
         "p99_latency": _make_graph(
             "99th Percentile Latency Over Time",
             lambda result: result.latency_percentiles[99],
+        ),
+        "p50_latency": _make_graph(
+            "50th Percentile Latency Over Time",
+            lambda result: result.latency_percentiles[50],
         ),
     }
 
@@ -340,7 +347,9 @@ def produce_per_server_type_graphs(
 
 
 def write_report(
-    benchmark_results: Iterable[BenchmarkResult], filename: str = "report.html", rps_for_latency: float = 500.0
+    benchmark_results: Iterable[BenchmarkResult],
+    filename: str = "report.html",
+    rps_for_latency: float = 500.0,
 ) -> None:
     with open(filename, "w") as file_:
         indent = 0
@@ -415,6 +424,7 @@ def write_report(
                                         "average_latency",
                                         "p90_latency",
                                         "p99_latency",
+                                        "p50_latency",
                                     ]:
                                         with tag("li"):
                                             w(
@@ -447,7 +457,9 @@ def write_report(
                                                 w(
                                                     f"Max Throughput: {result.max_throughput:.2f} rps"
                                                 )
-                                            latency_at_rps = result.latency_at_rps(rps_for_latency)
+                                            latency_at_rps = result.latency_at_rps(
+                                                rps_for_latency
+                                            )
                                             with tag(
                                                 "li",
                                                 style=f"color: {choose_colour_bad_to_good(1 - (latency_at_rps - min_latency_at_rps) / (max_latency_at_rps - min_latency_at_rps) if max_latency_at_rps > min_latency_at_rps else 0.0)}",
@@ -549,10 +561,10 @@ def main(bin_size: float = 1.0) -> None:
 
 
 if __name__ == "__main__":
-    
-
     parser = argparse.ArgumentParser()
-    parser.add_argument("--bin-size", type=float, default=1.0, help="Bin size for data aggregation")
+    parser.add_argument(
+        "--bin-size", type=float, default=1.0, help="Bin size for data aggregation"
+    )
     args = parser.parse_args()
 
     main(bin_size=args.bin_size)
