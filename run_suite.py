@@ -29,12 +29,20 @@ if __name__ == "__main__":
         action="store_true",
         help="Stop the benchmark suite if any individual benchmark fails",
     )
+    argparser.add_argument(
+        "--run-threaded-benchmarks-with-cpu-quota",
+        default=None,
+        type=int,
+        help="If set, run benchmarks with _threaded in their name with a CPU quota",
+    )
     args = argparser.parse_args()
 
     expected_duration = (
         args.duration * len(ENDPOINTS) * len(ServerTypes) * len(TEST_CLASSES)
     )
-    expected_completion_time = datetime.datetime.now() + datetime.timedelta(seconds=expected_duration)
+    expected_completion_time = datetime.datetime.now() + datetime.timedelta(
+        seconds=expected_duration
+    )
     print(
         f"Running benchmark suite. Expected completion time: {expected_completion_time:%Y-%m-%d %H:%M:%S}"
     )
@@ -62,6 +70,14 @@ if __name__ == "__main__":
                         str(args.initial_rate),
                         "--final-rate",
                         str(args.final_rate),
+                        *(
+                            [
+                                "--run-threaded-benchmarks-with-cpu-quota",
+                                str(args.run_threaded_benchmarks_with_cpu_quota),
+                            ]
+                            if args.run_threaded_benchmarks_with_cpu_quota is not None
+                            else []
+                        ),
                     ],
                     check=args.stop_on_error,
                 )

@@ -1124,6 +1124,12 @@ if __name__ == "__main__":
         default=AsgiServer.GRANIAN,
         help="ASGI server to use for the test",
     )
+    parser.add_argument(
+        "--run-threaded-benchmarks-with-cpu-quota",
+        default=None,
+        type=int,
+        help="If set, run benchmarks with _threaded in their name with a CPU quota",
+    )
     args = parser.parse_args()
 
     if args.enable_logging or args.debug:
@@ -1142,7 +1148,9 @@ if __name__ == "__main__":
             str(venv_path / "bin") + os.pathsep + venv_environ["PATH"]
         )
         venv_environ["VIRTUAL_ENV"] = str(venv_path)
-        venv_environ['URLLIB3_NO_OVERRIDE'] = "1" # Avoid urllib3.future's overriding of urllib3
+        venv_environ["URLLIB3_NO_OVERRIDE"] = (
+            "1"  # Avoid urllib3.future's overriding of urllib3
+        )
 
         if not venv_path.exists():
             subprocess.run(
@@ -1152,11 +1160,27 @@ if __name__ == "__main__":
             subprocess.run(["uv", "sync", "--active"], env=venv_environ, check=True)
         # Re-exec the current script with the same arguments, but in the new venv
         threaded_executable = venv_path / "bin" / "python"
-        os.execve(
-            threaded_executable,
-            [str(threaded_executable), __file__] + sys.argv[1:],
-            venv_environ,
-        )
+        argv = [str(threaded_executable), __file__] + sys.argv[1:]
+        if args.run_threaded_benchmarks_with_cpu_quota is not None:
+            os.execvpe(
+                "systemd-run",
+                [
+                    "systemd-run",
+                    "--user",
+                    "-q",
+                    "--scope",
+                    "-p",
+                    f"CPUQuota={args.run_threaded_benchmarks_with_cpu_quota}%",
+                    *argv,
+                ],
+                venv_environ,
+            )
+        else:
+            os.execve(
+                threaded_executable,
+                argv,
+                venv_environ,
+            )
     elif not expect_threaded and not sys._is_gil_enabled():
         raise RuntimeError(
             "This benchmark expects a non-threaded interpreter."
