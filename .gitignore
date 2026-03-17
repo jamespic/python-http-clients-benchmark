@@ -10,3 +10,4 @@ wheels/
 .venv
 report.html
 results*.tar.*
+.venv-threaded

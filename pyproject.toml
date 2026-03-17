@@ -10,9 +10,7 @@ dependencies = [
     "httpx[http2]>=0.28.1",
     "httpx-aiohttp>=0.1.12",
     "invoke>=2.2.1",
-    "niquests>=3.17.0",
     "numpy>=2.4.2",
-    "orjson>=3.11.7",
     "pycurl>=7.45.7",
     "pygal>=3.1.0",
     "pyreqwest>=0.11.0",
@@ -21,7 +19,12 @@ dependencies = [
     "uvloop>=0.22.1",
     "hypercorn>=0.18.0",
     "httpcore-ms",
+    "niquests>=3.18.2",
+    "requests>=2.32.5",
 ]
+
+[tool.uv]
+no-binary-package = ["urllib3-future"]
 
 [dependency-groups]
 dev = [

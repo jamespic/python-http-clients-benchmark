@@ -1,6 +1,7 @@
 import asyncio
 import json
 
+hello_world = b"Hello, world!"
 
 async def handle_hello_world(scope, receive, send):
     assert scope["type"] == "http"
@@ -16,7 +17,7 @@ async def handle_hello_world(scope, receive, send):
     await send(
         {
             "type": "http.response.body",
-            "body": b"Hello, world!",
+            "body": hello_world,
         }
     )
 
@@ -36,7 +37,7 @@ async def handle_latency(scope, receive, send):
     await send(
         {
             "type": "http.response.body",
-            "body": b"Hello, world!",
+            "body": hello_world,
         }
     )
 
@@ -60,7 +61,7 @@ async def handle_post(scope, receive, send):
     await send(
         {
             "type": "http.response.body",
-            "body": b"Hello World!",
+            "body": hello_world,
         }
     )
 
@@ -90,6 +91,7 @@ async def handle_json_response(scope, receive, send):
 
 
 dummy_chunk = b"a" * 1024
+chunk_count = 1024
 
 
 async def handle_chunked(scope, receive, send):
@@ -103,7 +105,7 @@ async def handle_chunked(scope, receive, send):
             ],
         }
     )
-    for _ in range(1023):
+    for _ in range(chunk_count - 1):
         await send(
             {
                 "type": "http.response.body",
@@ -118,6 +120,7 @@ async def handle_chunked(scope, receive, send):
         }
     )
 
+not_found = b"Not found"
 
 async def handle_not_found(scope, receive, send):
     assert scope["type"] == "http"
@@ -133,9 +136,16 @@ async def handle_not_found(scope, receive, send):
     await send(
         {
             "type": "http.response.body",
-            "body": b"Not found",
+            "body": not_found,
         }
     )
+
+possible_content_lengths = {
+    len(hello_world),
+    len(dummy_json),
+    len(dummy_chunk) * chunk_count,
+    len(not_found),
+}
 
 
 HANDLERS = {

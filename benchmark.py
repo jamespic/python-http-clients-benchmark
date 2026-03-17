@@ -1,17 +1,25 @@
 import asyncio
 import datetime
+import importlib.metadata as meta
+import json
+import os
 import resource
 import ssl
 import subprocess
 import sys
+import threading
 import time
+from collections.abc import Sized
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from enum import StrEnum
 from logging import DEBUG, INFO, basicConfig, getLogger
 from math import sqrt
+from pathlib import Path
 from random import Random
 from time import monotonic, perf_counter
+from types import CoroutineType, ModuleType
 from typing import Iterator
 from urllib.request import urlopen
 
@@ -19,13 +27,26 @@ import aiohttp
 import httpx
 import httpx_aiohttp
 import niquests
-import orjson
-import pycurl
 import pyreqwest.client
+import requests
+import requests.adapters
 import trio
 import uvloop
 from pyreqwest.compatibility.httpx import HttpxTransport as HttpxPyreqwestTransport
+from pyreqwest.compatibility.httpx import (
+    SyncHttpxTransport as SyncHttpxPyreqwestTransport,
+)
 from pyreqwest.exceptions import StatusError
+
+from server import possible_content_lengths
+
+if any(
+    f.is_relative_to(meta.PackagePath("urllib3"))
+    for f in meta.files("urllib3.future")  # ty: ignore[not-iterable]
+):
+    raise RuntimeError(
+        "urllib3.future has overwritten urllib3. Ensure that URLLIB3_NO_OVERRIDE is set when installing urllib3.future"
+    )
 
 
 def poisson_process(duration: float, initial_rate: float, final_rate: float):
@@ -255,6 +276,10 @@ class BaseBenchmark:
         self._overall_stats += self._current_stats
         self._current_stats = Stats()
 
+    def check_content_length(self, content: Sized):
+        if len(content) not in possible_content_lengths:
+            raise ValueError(f"Unexpected content length {len(content)}")
+
 
 class AsyncioBenchmark(BaseBenchmark):
     async def set_up_task_group(self):
@@ -306,6 +331,89 @@ class TrioBenchmark(BaseBenchmark):
         return await trio.sleep(delay)
 
 
+class SynchronousBenchmark(AsyncioBenchmark):
+    async def set_up_task_group(self):
+        self._executor = ThreadPoolExecutor(MAX_CONNECTION_POOL_SIZE)
+        self.exit_stack.callback(
+            self._executor.shutdown, wait=False, cancel_futures=True
+        )
+        self._loop = asyncio.get_running_loop()
+        await super().set_up_task_group()
+
+    def _run_coroutine_that_never_actually_awaits[T](
+        self, coro: CoroutineType[None, None, T]
+    ) -> T:
+        """Dummy function to "run" A coroutine that isn't really a coroutine.
+
+        We're reusing the infrastructure we use to test async clients to test sync clients,
+        so we need to be able to "run" a coroutine that doesn't actually do any async work.
+        This function does that by just pumping "None" into the generator underlying the coroutine
+        until it finishes. If you put a coroutine in here that actually expects its yielded values
+        to be handled by an event loop, it will die.
+        """
+        while True:
+            try:
+                coro.send(None)
+            except StopIteration as e:
+                return e.value
+
+    def spawn_request(self, timestamp: float):
+        self._executor.submit(
+            self._run_coroutine_that_never_actually_awaits,
+            self._do_one_request(timestamp),
+        )
+
+    async def _do_request_with_timeout(self):
+        thread_id = threading.get_ident()
+        timer_handle: asyncio.TimerHandle
+        finished = False
+        lock = threading.Lock()
+
+        def abort():
+            nonlocal finished
+            if not finished:
+                with lock:
+                    if not finished:
+                        self.interrupt_thread(thread_id)
+
+        def set_timeout():
+            nonlocal timer_handle
+            timer_handle = self._loop.call_later(2 * self._timeout, abort)
+
+        def clear_timeout():
+            nonlocal timer_handle
+            timer_handle.cancel()
+
+        try:
+            self._loop.call_soon_threadsafe(set_timeout)
+            self._run_coroutine_that_never_actually_awaits(self.make_request())
+        finally:
+            with lock:
+                finished = True
+            self._loop.call_soon_threadsafe(clear_timeout)
+
+    def interrupt_thread(self, thread_id: int):
+        import ctypes
+
+        res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+            ctypes.c_ulong(thread_id), ctypes.py_object(TimeoutError)
+        )
+        if res == 0:
+            raise ValueError(f"No thread with id {thread_id}")
+
+    def _record_result(self, start_time_monotonic: float, latency: float):
+        self._loop.call_soon_threadsafe(
+            super()._record_result, start_time_monotonic, latency
+        )
+
+    def _record_failure(
+        self, start_time_monotonic: float, error: Exception, latency: float
+    ):
+        self._loop.call_soon_threadsafe(
+            super()._record_failure, start_time_monotonic, error, latency
+        )
+
+
 class HttpxBenchmark(BaseBenchmark):
     async def set_up_client(self):
         self._client = await self.make_client()
@@ -335,7 +443,7 @@ class HttpxBenchmark(BaseBenchmark):
         if response.headers["Content-Type"] == "application/json":
             response.json()
         else:
-            response.content
+            self.check_content_length(response.content)
 
 
 class HttpxAsyncioBenchmark(HttpxBenchmark, AsyncioBenchmark):
@@ -344,6 +452,38 @@ class HttpxAsyncioBenchmark(HttpxBenchmark, AsyncioBenchmark):
 
 class HttpxUvloopBenchmark(HttpxBenchmark, UvloopBenchmark):
     pass
+
+
+class HttpxSyncBenchmark(SynchronousBenchmark):
+    async def set_up_client(self):
+        self._client = self.make_client()
+
+    def make_client(self) -> httpx.Client:
+        return self.exit_stack.enter_context(
+            httpx.Client(
+                http2=True,
+                verify=ssl_context,
+                timeout=self._timeout,
+                limits=httpx.Limits(max_connections=MAX_CONNECTION_POOL_SIZE),
+            )
+        )
+
+    async def make_request(self):
+        if self._body is not None:
+            response = self._client.post(self._url, json=self._body)
+        else:
+            response = self._client.get(self._url)
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError:
+            # 404 is the only status we expect in the test, everything else is an error
+            assert response.status_code == 404
+        else:
+            assert response.status_code == 200
+        if response.headers["Content-Type"] == "application/json":
+            response.json()
+        else:
+            self.check_content_length(response.content)
 
 
 class HttpxTrioBenchmark(HttpxBenchmark, TrioBenchmark):
@@ -401,6 +541,25 @@ class HttpxPyreqwestUvloopBenchmark(HttpxPyreqwestBenchmark, UvloopBenchmark):
     pass
 
 
+class HttpxPyreqwestSyncBenchmark(HttpxSyncBenchmark):
+    def make_client(self) -> httpx.Client:
+        pyreqwest_client = self.exit_stack.enter_context(
+            pyreqwest.client.SyncClientBuilder()
+            .add_root_certificate_pem(server_ca_cert_pem)
+            .timeout(datetime.timedelta(seconds=self._timeout))
+            .max_connections(MAX_CONNECTION_POOL_SIZE)
+            .http2(True)
+            .http2_adaptive_window(True)
+            .build()
+        )
+        return self.exit_stack.enter_context(
+            httpx.Client(
+                transport=SyncHttpxPyreqwestTransport(pyreqwest_client),
+                timeout=self._timeout,
+            )
+        )
+
+
 class AiohttpHttpxTransportBenchmark(HttpxBenchmark, AsyncioBenchmark):
     async def make_client(self):
         return await self.exit_stack.enter_async_context(
@@ -451,11 +610,46 @@ class PyreqwestBenchmark(AsyncioBenchmark):
             if response.get_header("Content-Type") == "application/json":
                 await response.json()
             else:
-                await response.bytes()
+                self.check_content_length(await response.bytes())
 
 
 class PyreqwestUvloopBenchmark(PyreqwestBenchmark, UvloopBenchmark):
     pass
+
+
+class PyreqwestSyncBenchmark(SynchronousBenchmark):
+    async def set_up_client(self):
+        self._client = self.exit_stack.enter_context(
+            pyreqwest.client.SyncClientBuilder()
+            .add_root_certificate_pem(server_ca_cert_pem)
+            .timeout(datetime.timedelta(seconds=self._timeout))
+            .max_connections(MAX_CONNECTION_POOL_SIZE)
+            .http2(True)
+            .http2_adaptive_window(True)
+            .error_for_status(True)
+            .build()
+        )
+
+    async def make_request(self):
+        try:
+            if self._body is not None:
+                response = (
+                    self._client.post(self._url).body_json(self._body).build().send()
+                )
+            else:
+                response = self._client.get(self._url).build().send()
+        except StatusError as e:
+            # 404 is the only status we expect in the test, everything else is an error
+            assert e.details["status"] == 404
+            return
+        else:
+            assert response.status == 200
+            if response.get_header("Content-Type") == "application/json":
+                response.json()
+            else:
+                content = response.bytes()
+                assert content is not None
+                self.check_content_length(content)
 
 
 class AiohttpBenchmark(AsyncioBenchmark):
@@ -485,7 +679,7 @@ class AiohttpBenchmark(AsyncioBenchmark):
             if response.headers["Content-Type"] == "application/json":
                 await response.json()
             else:
-                await response.read()
+                self.check_content_length(await response.read())
 
 
 class AiohttpUvloopBenchmark(AiohttpBenchmark, UvloopBenchmark):
@@ -517,11 +711,77 @@ class NiquestsBenchmark(AsyncioBenchmark):
         if response.headers["Content-Type"] == "application/json":
             response.json()
         else:
-            response.content
+            content = response.content
+            assert content is not None
+            self.check_content_length(content)
 
 
 class NiquestsUvloopBenchmark(NiquestsBenchmark, UvloopBenchmark):
     pass
+
+
+class NiquestsSyncBenchmark(SynchronousBenchmark):
+    async def set_up_client(self):
+        self._client = self.exit_stack.enter_context(
+            niquests.Session(pool_maxsize=MAX_CONNECTION_POOL_SIZE)
+        )
+        self._client.verify = server_ca_cert_location
+
+    async def make_request(self):
+        if self._body is not None:
+            response = self._client.post(
+                self._url, json=self._body, timeout=self._timeout
+            )
+        else:
+            response = self._client.get(self._url, timeout=self._timeout)
+        try:
+            response.raise_for_status()
+        except niquests.exceptions.RequestException as e:
+            # 404 is the only status we expect in the test, everything else is an error
+            assert e.response is not None
+            assert e.response.status_code == 404
+        else:
+            assert response.status_code == 200
+        if response.headers["Content-Type"] == "application/json":
+            response.json()
+        else:
+            content = response.content
+            assert content is not None
+            self.check_content_length(content)
+
+
+class RequestsBenchmark(SynchronousBenchmark):
+    async def set_up_client(self):
+        import requests
+
+        self._client = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_maxsize=MAX_CONNECTION_POOL_SIZE)
+        self._client.mount("http://", adapter)
+        self._client.mount("https://", adapter)
+        self._client.verify = server_ca_cert_location
+        self.exit_stack.enter_context(self._client)
+
+    async def make_request(self):
+        if self._body is not None:
+            response = self._client.post(
+                self._url, json=self._body, timeout=self._timeout
+            )
+        else:
+            response = self._client.get(self._url, timeout=self._timeout)
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as e:
+            # 404 is the only status we expect in the test, everything else is an error
+            assert e.response is not None
+            assert e.response.status_code == 404
+        else:
+            assert response.status_code == 200
+        if response.headers["Content-Type"] == "application/json":
+            response.json()
+        else:
+            content = response.content
+            assert content is not None
+            self.check_content_length(content)
 
 
 @dataclass(frozen=True)
@@ -530,17 +790,27 @@ class CurlFDState:
     write: bool
 
 
-FD_STATES = {
-    pycurl.POLL_IN: CurlFDState(read=True, write=False),
-    pycurl.POLL_OUT: CurlFDState(read=False, write=True),
-    pycurl.POLL_INOUT: CurlFDState(read=True, write=True),
-    pycurl.POLL_REMOVE: CurlFDState(read=False, write=False),
-}
-FD_STATES_DEFAULT = CurlFDState(read=False, write=False)
+pycurl: ModuleType
+FD_STATES: dict[int, CurlFDState]
+FD_STATES_DEFAULT: CurlFDState
+
+
+def _pycurl_global_init():
+    global pycurl, FD_STATES, FD_STATES_DEFAULT
+    import pycurl
+
+    FD_STATES = {
+        pycurl.POLL_IN: CurlFDState(read=True, write=False),
+        pycurl.POLL_OUT: CurlFDState(read=False, write=True),
+        pycurl.POLL_INOUT: CurlFDState(read=True, write=True),
+        pycurl.POLL_REMOVE: CurlFDState(read=False, write=False),
+    }
+    FD_STATES_DEFAULT = CurlFDState(read=False, write=False)
 
 
 class PyCurlBenchmark(AsyncioBenchmark):
     async def set_up_client(self):
+        _pycurl_global_init()
         self._loop = asyncio.get_running_loop()
         self._multi = pycurl.CurlMulti()
         self._current_fd_states = {}
@@ -635,7 +905,7 @@ class PyCurlBenchmark(AsyncioBenchmark):
         if self._body is not None:
             curl.setopt(pycurl.POST, True)
             curl.setopt(pycurl.HTTPHEADER, ["Content-Type: application/json"])
-            curl.setopt(pycurl.POSTFIELDS, orjson.dumps(self._body))
+            curl.setopt(pycurl.POSTFIELDS, json.dumps(self._body))
 
         response: bytearray = bytearray()
 
@@ -662,7 +932,9 @@ class PyCurlBenchmark(AsyncioBenchmark):
             assert curl.getinfo(pycurl.RESPONSE_CODE) in (200, 404)
             if headers.get("content-type") == "application/json":
                 assert response is not None
-                orjson.loads(response)
+                json.loads(response)
+            else:
+                self.check_content_length(response)
         finally:
             self._multi.remove_handle(curl)
             self._reuse_pool.put_nowait(curl)
@@ -676,19 +948,29 @@ TEST_CLASSES = {
     "httpx_asyncio": HttpxAsyncioBenchmark,
     "httpx_uvloop": HttpxUvloopBenchmark,
     "httpx_trio": HttpxTrioBenchmark,
+    "httpx_sync": HttpxSyncBenchmark,
+    "httpx_threaded": HttpxSyncBenchmark,
     "httpx_ms_asyncio": HttpxMsAsyncioBenchmark,
     "httpx_ms_uvloop": HttpxMsUvloopBenchmark,
     "httpx_ms_trio": HttpxMsTrioBenchmark,
     "httpx_pyreqwest": HttpxPyreqwestBenchmark,
     "httpx_pyreqwest_uvloop": HttpxPyreqwestUvloopBenchmark,
+    "httpx_pyreqwest_sync": HttpxPyreqwestSyncBenchmark,
+    "httpx_pyreqwest_threaded": HttpxPyreqwestSyncBenchmark,
     "httpx_aiohttp": AiohttpHttpxTransportBenchmark,
     "httpx_aiohttp_uvloop": AiohttpHttpsTransportUvloopBenchmark,
     "pyreqwest": PyreqwestBenchmark,
     "pyreqwest_uvloop": PyreqwestUvloopBenchmark,
+    "pyreqwest_sync": PyreqwestSyncBenchmark,
+    "pyreqwest_threaded": PyreqwestSyncBenchmark,
     "aiohttp": AiohttpBenchmark,
     "aiohttp_uvloop": AiohttpUvloopBenchmark,
     "niquests": NiquestsBenchmark,
     "niquests_uvloop": NiquestsUvloopBenchmark,
+    "niquests_sync": NiquestsSyncBenchmark,
+    "niquests_threaded": NiquestsSyncBenchmark,
+    "requests_sync": RequestsBenchmark,
+    "requests_threaded": RequestsBenchmark,
     "pycurl": PyCurlBenchmark,
     "pycurl_uvloop": PyCurlUvloopBenchmark,
 }
@@ -809,6 +1091,12 @@ if __name__ == "__main__":
         "--duration", type=float, default=10.0, help="Duration of the test in seconds"
     )
     parser.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        help="Timeout for individual requests in seconds",
+    )
+    parser.add_argument(
         "--initial-rate",
         type=float,
         default=1.0,
@@ -844,6 +1132,39 @@ if __name__ == "__main__":
             level=DEBUG if args.debug else INFO,
         )
 
+    expect_threaded = args.test_class.endswith("_threaded")
+
+    if expect_threaded and sys._is_gil_enabled():
+        # Try re-running with threaded interpreter from threaded venv, that lives under .venv-threaded
+        venv_path = Path(".venv-threaded").resolve()
+        venv_environ = os.environ.copy()
+        venv_environ["PATH"] = (
+            str(venv_path / "bin") + os.pathsep + venv_environ["PATH"]
+        )
+        venv_environ["VIRTUAL_ENV"] = str(venv_path)
+        venv_environ['URLLIB3_NO_OVERRIDE'] = "1" # Avoid urllib3.future's overriding of urllib3
+
+        if not venv_path.exists():
+            subprocess.run(
+                ["uv", "venv", "--python", "3.14t", ".venv-threaded"], check=True
+            )
+            # Make uv sync venv packages
+            subprocess.run(["uv", "sync", "--active"], env=venv_environ, check=True)
+        # Re-exec the current script with the same arguments, but in the new venv
+        threaded_executable = venv_path / "bin" / "python"
+        os.execve(
+            threaded_executable,
+            [str(threaded_executable), __file__] + sys.argv[1:],
+            venv_environ,
+        )
+    elif not expect_threaded and not sys._is_gil_enabled():
+        raise RuntimeError(
+            "This benchmark expects a non-threaded interpreter."
+            " Please ensure the script is being run with a"
+            " Python interpreter that has the GIL enabled,"
+            " possibly by rebuilding your uv venv with 'uv venv --python 3.14'"
+        )
+
     resource.setrlimit(resource.RLIMIT_NOFILE, (100000, 100000))
     with run_server(args.server_type, args.asgi_server) as base_url:
         endpoint = ENDPOINTS[args.endpoint]
@@ -856,6 +1177,8 @@ if __name__ == "__main__":
             url=base_url + endpoint.path,
             expected_duration=args.duration,
             body=endpoint.body,
+            timeout=args.timeout,
             debug=args.debug,
         )
         benchmark.run_test()
+2
