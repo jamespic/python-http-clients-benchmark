@@ -5,6 +5,7 @@ from collections.abc import Generator, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
+from math import log
 from os.path import basename, splitext
 from typing import Callable, TypedDict, cast
 
@@ -440,8 +441,21 @@ def write_report(
                                 result = results_lookup.get(
                                     (server_type, endpoint, client_under_test)
                                 )
+
                                 with tag("td"):
                                     if result is not None:
+                                        if max_latency_at_rps > min_latency_at_rps:
+                                            latency_at_rps = result.latency_at_rps(
+                                                rps_for_latency
+                                            )
+                                            latency_goodness = 1 - log(
+                                                latency_at_rps / min_latency_at_rps
+                                            ) / log(
+                                                max_latency_at_rps / min_latency_at_rps
+                                            )
+                                        else:
+                                            latency_goodness = 1.0
+
                                         with tag("ul"):
                                             with tag(
                                                 "li",
@@ -457,12 +471,10 @@ def write_report(
                                                 w(
                                                     f"Max Throughput: {result.max_throughput:.2f} rps"
                                                 )
-                                            latency_at_rps = result.latency_at_rps(
-                                                rps_for_latency
-                                            )
+
                                             with tag(
                                                 "li",
-                                                style=f"color: {choose_colour_bad_to_good(1 - (latency_at_rps - min_latency_at_rps) / (max_latency_at_rps - min_latency_at_rps) if max_latency_at_rps > min_latency_at_rps else 0.0)}",
+                                                style=f"color: {choose_colour_bad_to_good(latency_goodness)}",
                                             ):
                                                 w(
                                                     f"Latency at {rps_for_latency} rps: {latency_at_rps:.3f} s"
