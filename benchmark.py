@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from collections.abc import Sized
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack, contextmanager, suppress
@@ -331,11 +332,11 @@ class TrioBenchmark(BaseBenchmark):
         return await trio.sleep(delay)
 
 
-class SynchronousBenchmark(AsyncioBenchmark):
+class SynchronousBenchmark(UvloopBenchmark):
     async def set_up_task_group(self):
         self._executor = ThreadPoolExecutor(MAX_CONNECTION_POOL_SIZE)
         self.exit_stack.callback(
-            self._executor.shutdown, wait=False, cancel_futures=True
+            self._executor.shutdown, wait=True, cancel_futures=True
         )
         self._loop = asyncio.get_running_loop()
         await super().set_up_task_group()
@@ -364,43 +365,18 @@ class SynchronousBenchmark(AsyncioBenchmark):
         )
 
     async def _do_request_with_timeout(self):
-        thread_id = threading.get_ident()
-        timer_handle: asyncio.TimerHandle
-        finished = False
-        lock = threading.Lock()
-
-        def abort():
-            nonlocal finished
-            if not finished:
-                with lock:
-                    if not finished:
-                        self.interrupt_thread(thread_id)
-
-        def set_timeout():
-            nonlocal timer_handle
-            timer_handle = self._loop.call_later(2 * self._timeout, abort)
-
-        def clear_timeout():
-            nonlocal timer_handle
-            timer_handle.cancel()
-
-        try:
-            self._loop.call_soon_threadsafe(set_timeout)
-            self._run_coroutine_that_never_actually_awaits(self.make_request())
-        finally:
-            with lock:
-                finished = True
-            self._loop.call_soon_threadsafe(clear_timeout)
-
-    def interrupt_thread(self, thread_id: int):
-        import ctypes
-
-        res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
-            ctypes.c_ulong(thread_id), ctypes.py_object(TimeoutError)
-        )
-        if res == 0:
-            raise ValueError(f"No thread with id {thread_id}")
-
+        # We don't attempt to wrap synchronous requests in a timeout, since there's
+        # no good way to do that. We tried PyThreadState_SetAsyncExc fuckery and
+        # it caused a deadlock in HTTPX, acquiring the stream semaphore.
+        # HTTPX's use of semaphores seems unprincipled at best - looking at the
+        # line where the threads were blocking on acquire
+        # (https://github.com/encode/httpcore/blob/master/httpcore/_sync/http2.py#L131),
+        # there look to be a lot of ways to escape without releasing it.
+        #
+        # This comment in HTTPX on cancellation in sync code is also relevant:
+        # https://github.com/encode/httpcore/blob/master/httpcore/_synchronization.py#L306
+        self._run_coroutine_that_never_actually_awaits(self.make_request())
+        
     def _record_result(self, start_time_monotonic: float, latency: float):
         self._loop.call_soon_threadsafe(
             super()._record_result, start_time_monotonic, latency
