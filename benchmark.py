@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import traceback
+from collections import Counter
 from collections.abc import Sized
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack, contextmanager, suppress
@@ -20,7 +21,7 @@ from math import sqrt
 from pathlib import Path
 from random import Random
 from time import monotonic, perf_counter
-from types import CoroutineType, ModuleType
+from types import ModuleType
 from typing import Iterator
 from urllib.request import urlopen
 
@@ -119,16 +120,18 @@ class Stats:
         self.delays += 1
 
     def mean_latency(self):
-        if self.successes == 0:
+        total = self.successes + self.failures
+        if total == 0:
             return 0.0
-        return self.total_latency / self.successes
+        return self.total_latency / total
 
     def latency_stddev(self):
-        if self.successes == 0:
+        total = self.successes + self.failures
+        if total == 0:
             return 0.0
         mean = self.mean_latency()
         try:
-            return sqrt(self.sum_of_squares / self.successes - mean * mean)
+            return sqrt(self.sum_of_squares / total - mean * mean)
         except ValueError:
             return 0.0
 
@@ -166,7 +169,7 @@ class BaseBenchmark:
     def __init__(
         self,
         start_time_generator: Iterator[float],
-        output_file: str,
+        test_name: str,
         url: str,
         expected_duration: float,
         body: dict | None = None,
@@ -174,7 +177,9 @@ class BaseBenchmark:
         debug: bool = False,
     ):
         self._start_time_generator = start_time_generator
-        self._output_file = open(output_file, "w")
+        self._test_name = test_name
+        self._output_file = open(f"results/{test_name}.csv", "w")
+        self._errors_counter = Counter()
         self._url = url
         self._expected_duration = expected_duration
         self._body = body
@@ -244,6 +249,7 @@ class BaseBenchmark:
         raise NotImplementedError("Subclasses must implement set_up_client")
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self._save_error_counts()
         await self.exit_stack.__aexit__(exc_type, exc_val, exc_tb)
         self._flush_stats()
         print("Final stats:", file=sys.stderr)
@@ -261,8 +267,18 @@ class BaseBenchmark:
         self._output_file.write(f"failure,{start_time_monotonic},{repr(error)}\n")
         self._maybe_print_stats()
         self._current_stats.record_failure(latency)
+        self._errors_counter[
+            "".join(traceback.format_exception(type(error), error, error.__traceback__))
+        ] += 1
         if self._debug:
             self._logger.exception(f"Request failed with error: {error}")
+
+    def _save_error_counts(self):
+        with open(f"results/errors_{self._test_name}.log", "w") as f:
+            for error, count in self._errors_counter.most_common():
+                f.write(f"Count: {count}\n")
+                f.write(error)
+                f.write("\n\n")
 
     def _record_delay(self, start_time_monotonic: float, delay: float):
         self._output_file.write(f"delay,{start_time_monotonic},{delay}\n")
@@ -338,56 +354,52 @@ class SynchronousBenchmark(UvloopBenchmark):
         self.exit_stack.callback(
             self._executor.shutdown, wait=True, cancel_futures=True
         )
+        threading.Thread(target=self.if_test_doesnt_finish_in_time_just_die).start()
         self._loop = asyncio.get_running_loop()
         await super().set_up_task_group()
 
-    def _run_coroutine_that_never_actually_awaits[T](
-        self, coro: CoroutineType[None, None, T]
-    ) -> T:
-        """Dummy function to "run" A coroutine that isn't really a coroutine.
-
-        We're reusing the infrastructure we use to test async clients to test sync clients,
-        so we need to be able to "run" a coroutine that doesn't actually do any async work.
-        This function does that by just pumping "None" into the generator underlying the coroutine
-        until it finishes. If you put a coroutine in here that actually expects its yielded values
-        to be handled by an event loop, it will die.
-        """
-        while True:
-            try:
-                coro.send(None)
-            except StopIteration as e:
-                return e.value
-
     def spawn_request(self, timestamp: float):
-        self._executor.submit(
-            self._run_coroutine_that_never_actually_awaits,
-            self._do_one_request(timestamp),
-        )
+        self._executor.submit(self._do_one_request, timestamp)
 
-    async def _do_request_with_timeout(self):
-        # We don't attempt to wrap synchronous requests in a timeout, since there's
-        # no good way to do that. We tried PyThreadState_SetAsyncExc fuckery and
-        # it caused a deadlock in HTTPX, acquiring the stream semaphore.
-        # HTTPX's use of semaphores seems unprincipled at best - looking at the
-        # line where the threads were blocking on acquire
-        # (https://github.com/encode/httpcore/blob/master/httpcore/_sync/http2.py#L131),
-        # there look to be a lot of ways to escape without releasing it.
-        #
-        # This comment in HTTPX on cancellation in sync code is also relevant:
-        # https://github.com/encode/httpcore/blob/master/httpcore/_synchronization.py#L306
-        self._run_coroutine_that_never_actually_awaits(self.make_request())
-        
-    def _record_result(self, start_time_monotonic: float, latency: float):
-        self._loop.call_soon_threadsafe(
-            super()._record_result, start_time_monotonic, latency
-        )
+    def _do_one_request(self, timestamp: float):
+        start_perf_counter = perf_counter()
+        try:
+            self.make_request()
+        except Exception as e:
+            self._loop.call_soon_threadsafe(
+                self._record_failure,
+                timestamp,
+                e,
+                perf_counter() - start_perf_counter,
+            )
+        else:
+            end_perf_counter = perf_counter()
+            latency = end_perf_counter - start_perf_counter
+            self._loop.call_soon_threadsafe(self._record_result, timestamp, latency)
 
-    def _record_failure(
-        self, start_time_monotonic: float, error: Exception, latency: float
-    ):
-        self._loop.call_soon_threadsafe(
-            super()._record_failure, start_time_monotonic, error, latency
+    def if_test_doesnt_finish_in_time_just_die(self):
+        thread_id = threading.get_ident()
+        expected_finish_time = monotonic() + self._expected_duration + 3 * self._timeout
+        while monotonic() < expected_finish_time:
+            if all(t.ident == thread_id or t.daemon for t in threading.enumerate()):
+                return
+            time.sleep(1)
+        print(
+            "Performing an undignified exit since the test didn't finish in time",
+            file=sys.stderr,
         )
+        with open(
+            f"results/hang_{self._test_name}.log",
+            "w",
+        ) as f:
+            stack_trace_counts = Counter()
+            for stack in sys._current_frames().values():
+                stack_trace_counts["".join(traceback.format_stack(stack))] += 1
+            for stack_trace, count in stack_trace_counts.most_common():
+                f.write(f"A total of {count} threads were in the following state:\n")
+                f.write(stack_trace)
+                f.write("\n\n")
+        os._exit(1)
 
 
 class HttpxBenchmark(BaseBenchmark):
@@ -444,7 +456,7 @@ class HttpxSyncBenchmark(SynchronousBenchmark):
             )
         )
 
-    async def make_request(self):
+    def make_request(self):
         if self._body is not None:
             response = self._client.post(self._url, json=self._body)
         else:
@@ -606,7 +618,7 @@ class PyreqwestSyncBenchmark(SynchronousBenchmark):
             .build()
         )
 
-    async def make_request(self):
+    def make_request(self):
         try:
             if self._body is not None:
                 response = (
@@ -699,17 +711,17 @@ class NiquestsUvloopBenchmark(NiquestsBenchmark, UvloopBenchmark):
 class NiquestsSyncBenchmark(SynchronousBenchmark):
     async def set_up_client(self):
         self._client = self.exit_stack.enter_context(
-            niquests.Session(pool_maxsize=MAX_CONNECTION_POOL_SIZE)
+            niquests.Session(
+                pool_maxsize=MAX_CONNECTION_POOL_SIZE, timeout=self._timeout
+            )
         )
         self._client.verify = server_ca_cert_location
 
-    async def make_request(self):
+    def make_request(self):
         if self._body is not None:
-            response = self._client.post(
-                self._url, json=self._body, timeout=self._timeout
-            )
+            response = self._client.post(self._url, json=self._body)
         else:
-            response = self._client.get(self._url, timeout=self._timeout)
+            response = self._client.get(self._url)
         try:
             response.raise_for_status()
         except niquests.exceptions.RequestException as e:
@@ -737,7 +749,7 @@ class RequestsBenchmark(SynchronousBenchmark):
         self._client.verify = server_ca_cert_location
         self.exit_stack.enter_context(self._client)
 
-    async def make_request(self):
+    def make_request(self):
         if self._body is not None:
             response = self._client.post(
                 self._url, json=self._body, timeout=self._timeout
@@ -980,6 +992,8 @@ def run_server(
                 "asginl",
                 "--workers",
                 f"{WORKERS}",
+                "--backlog",
+                f"{MAX_CONNECTION_POOL_SIZE}",
             ]
             ssl_opts = [
                 "--ssl-keyfile",
@@ -1011,6 +1025,8 @@ def run_server(
                 else "https://localhost:8443"
             )
     with open("results/server.log", "wb") as log_file:
+        # Kill any left over from previous runs
+        subprocess.run(["pkill", cmd[0]], check=False)
         process = subprocess.Popen(cmd, stdout=log_file, stderr=log_file)
         for _ in range(10):
             try:
@@ -1042,7 +1058,7 @@ ENDPOINTS = {
     "hello": Endpoint("/hello", None),
     "json": Endpoint("/json", None),
     "chunked": Endpoint("/chunked", None),
-    "post": Endpoint("/post", {f"key{i}": ["value"] * 50 for i in range(50)}),
+    "post": Endpoint("/post", {f"key{i}": ["value"] * 250 for i in range(250)}),
     "latency": Endpoint("/latency", None),
     "notfound": Endpoint("/notfound", None),
 }
@@ -1173,7 +1189,7 @@ if __name__ == "__main__":
             start_time_generator=poisson_process(
                 args.duration, args.initial_rate, args.final_rate
             ),
-            output_file=f"results/{args.test_class}_{args.endpoint}_{args.server_type}.csv",
+            test_name=f"{args.test_class}_{args.endpoint}_{args.server_type}",
             url=base_url + endpoint.path,
             expected_duration=args.duration,
             body=endpoint.body,
@@ -1181,4 +1197,3 @@ if __name__ == "__main__":
             debug=args.debug,
         )
         benchmark.run_test()
-2

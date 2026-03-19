@@ -3,6 +3,7 @@ import json
 
 hello_world = b"Hello, world!"
 
+
 async def handle_hello_world(scope, receive, send):
     assert scope["type"] == "http"
     await send(
@@ -66,7 +67,7 @@ async def handle_post(scope, receive, send):
     )
 
 
-dummy_json = json.dumps({f"key{i}": ["value"] * 50 for i in range(50)}).encode(
+dummy_json = json.dumps({f"key{i}": ["value"] * 250 for i in range(250)}).encode(
     "utf-8"
 )
 
@@ -120,7 +121,9 @@ async def handle_chunked(scope, receive, send):
         }
     )
 
+
 not_found = b"Not found"
+
 
 async def handle_not_found(scope, receive, send):
     assert scope["type"] == "http"
@@ -139,6 +142,7 @@ async def handle_not_found(scope, receive, send):
             "body": not_found,
         }
     )
+
 
 possible_content_lengths = {
     len(hello_world),
