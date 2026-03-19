@@ -197,9 +197,9 @@ class BaseBenchmark:
 
     async def run_test_in_loop(self):
         async with self:
-            test_start_time = monotonic()
+            self._test_start_time = monotonic()
             for start_time in self._start_time_generator:
-                delay = test_start_time + start_time - monotonic()
+                delay = start_time - self._relative_time()
                 if delay > 0:
                     await self.sleep(delay)
                 elif delay < -self._timeout:
@@ -211,16 +211,20 @@ class BaseBenchmark:
                 else:
                     self._record_delay(start_time, -delay)
                     await self.sleep(0)
-                self.spawn_request(start_time)
+                self.spawn_request()
+    
+    def _relative_time(self):
+        return monotonic() - self._test_start_time
 
-    def spawn_request(self, timestamp: float):
+    def spawn_request(self):
         raise NotImplementedError("Subclasses must implement spawn_request")
 
     async def sleep(self, delay: float):
         raise NotImplementedError("Subclasses must implement sleep")
 
-    async def _do_one_request(self, timestamp: float):
+    async def _do_one_request(self):
         start_perf_counter = perf_counter()
+        timestamp = self._relative_time()
         try:
             await self._do_request_with_timeout()
         except Exception as e:
@@ -308,8 +312,8 @@ class AsyncioBenchmark(BaseBenchmark):
             asyncio.TaskGroup()
         )
 
-    def spawn_request(self, timestamp: float):
-        self._task_group.create_task(self._do_one_request(timestamp))
+    def spawn_request(self):
+        self._task_group.create_task(self._do_one_request())
 
     async def _do_request_with_timeout(self):
         async with asyncio.timeout(2 * self._timeout):
@@ -334,8 +338,8 @@ class TrioBenchmark(BaseBenchmark):
         )
         self._nursery = await self.exit_stack.enter_async_context(trio.open_nursery())
 
-    def spawn_request(self, timestamp: float):
-        self._nursery.start_soon(self._do_one_request, timestamp)
+    def spawn_request(self):
+        self._nursery.start_soon(self._do_one_request)
 
     async def _do_request_with_timeout(self):
         with trio.fail_after(2 * self._timeout):
@@ -358,11 +362,12 @@ class SynchronousBenchmark(UvloopBenchmark):
         self._loop = asyncio.get_running_loop()
         await super().set_up_task_group()
 
-    def spawn_request(self, timestamp: float):
-        self._executor.submit(self._do_one_request, timestamp)
+    def spawn_request(self):
+        self._executor.submit(self._do_one_request)
 
-    def _do_one_request(self, timestamp: float):
+    def _do_one_request(self):
         start_perf_counter = perf_counter()
+        timestamp = self._relative_time()
         try:
             self.make_request()
         except Exception as e:
@@ -1030,7 +1035,8 @@ def run_server(
         process = subprocess.Popen(cmd, stdout=log_file, stderr=log_file)
         for _ in range(10):
             try:
-                urlopen(base_url + "/hello", context=ssl_context, timeout=1)
+                resp = urlopen(base_url + "/hello", context=ssl_context, timeout=1)
+                assert resp.status == 200
                 break
             except Exception:
                 time.sleep(0.5)
