@@ -29,6 +29,7 @@ import aiohttp
 import httpx
 import httpx_aiohttp
 import niquests
+import psutil
 import pyreqwest.client
 import requests
 import requests.adapters
@@ -162,6 +163,37 @@ class Stats:
         )
 
 
+class ResourceStats:
+    def __init__(self):
+        self.start_time = monotonic()
+        self.start_cpu_times = psutil.Process().cpu_times()
+        self.start_context_switches = psutil.Process().num_ctx_switches()
+
+    def stats(self):
+        elapsed = monotonic() - self.start_time
+        process = psutil.Process()
+        cpu_times = process.cpu_times()
+        context_switches = process.num_ctx_switches()
+        return {
+            "user_cpu_time_percent": (cpu_times.user - self.start_cpu_times.user)
+            / elapsed
+            * 100,
+            "system_cpu_time_percent": (cpu_times.system - self.start_cpu_times.system)
+            / elapsed
+            * 100,
+            "voluntary_context_switches_per_sec": (
+                context_switches.voluntary - self.start_context_switches.voluntary
+            )
+            / elapsed,
+            "involuntary_context_switches_per_sec": (
+                context_switches.involuntary - self.start_context_switches.involuntary
+            )
+            / elapsed,
+            "memory_rss": process.memory_info().rss,
+            "memory_vms": process.memory_info().vms,
+        }
+
+
 MAX_CONNECTION_POOL_SIZE = 2000
 
 
@@ -186,6 +218,7 @@ class BaseBenchmark:
         self._timeout = timeout
         self._overall_stats = Stats()
         self._current_stats = Stats()
+        self._resource_stats = ResourceStats()
         self._debug = debug
         self._logger = getLogger(self.__class__.__name__)
 
@@ -212,7 +245,7 @@ class BaseBenchmark:
                     self._record_delay(start_time, -delay)
                     await self.sleep(0)
                 self.spawn_request()
-    
+
     def _relative_time(self):
         return monotonic() - self._test_start_time
 
@@ -240,6 +273,9 @@ class BaseBenchmark:
         raise NotImplementedError("Subclasses must implement _do_request_with_timeout")
 
     async def __aenter__(self):
+        threading.Thread(
+            target=self.if_test_doesnt_finish_in_time_just_die, daemon=True
+        ).start()
         self.exit_stack = AsyncExitStack()
         await self.exit_stack.__aenter__()
         await self.set_up_task_group()
@@ -297,9 +333,37 @@ class BaseBenchmark:
         self._overall_stats += self._current_stats
         self._current_stats = Stats()
 
+        self._output_file.write(
+            f"resource_stats,{self._relative_time()},{json.dumps(self._resource_stats.stats())}\n"
+        )
+        self._resource_stats = ResourceStats()
+
     def check_content_length(self, content: Sized):
         if len(content) not in possible_content_lengths:
             raise ValueError(f"Unexpected content length {len(content)}")
+
+    def if_test_doesnt_finish_in_time_just_die(self):
+        expected_finish_time = monotonic() + self._expected_duration + 4 * self._timeout
+        while monotonic() < expected_finish_time:
+            if all(t.daemon for t in threading.enumerate()):
+                return
+            time.sleep(1)
+        print(
+            "Performing an undignified exit since the test didn't finish in time",
+            file=sys.stderr,
+        )
+        with open(
+            f"results/hang_{self._test_name}.log",
+            "w",
+        ) as f:
+            stack_trace_counts = Counter()
+            for stack in sys._current_frames().values():
+                stack_trace_counts["".join(traceback.format_stack(stack))] += 1
+            for stack_trace, count in stack_trace_counts.most_common():
+                f.write(f"A total of {count} threads were in the following state:\n")
+                f.write(stack_trace)
+                f.write("\n\n")
+        os._exit(1)
 
 
 class AsyncioBenchmark(BaseBenchmark):
@@ -358,7 +422,6 @@ class SynchronousBenchmark(UvloopBenchmark):
         self.exit_stack.callback(
             self._executor.shutdown, wait=True, cancel_futures=True
         )
-        threading.Thread(target=self.if_test_doesnt_finish_in_time_just_die).start()
         self._loop = asyncio.get_running_loop()
         await super().set_up_task_group()
 
@@ -381,30 +444,6 @@ class SynchronousBenchmark(UvloopBenchmark):
             end_perf_counter = perf_counter()
             latency = end_perf_counter - start_perf_counter
             self._loop.call_soon_threadsafe(self._record_result, timestamp, latency)
-
-    def if_test_doesnt_finish_in_time_just_die(self):
-        thread_id = threading.get_ident()
-        expected_finish_time = monotonic() + self._expected_duration + 3 * self._timeout
-        while monotonic() < expected_finish_time:
-            if all(t.ident == thread_id or t.daemon for t in threading.enumerate()):
-                return
-            time.sleep(1)
-        print(
-            "Performing an undignified exit since the test didn't finish in time",
-            file=sys.stderr,
-        )
-        with open(
-            f"results/hang_{self._test_name}.log",
-            "w",
-        ) as f:
-            stack_trace_counts = Counter()
-            for stack in sys._current_frames().values():
-                stack_trace_counts["".join(traceback.format_stack(stack))] += 1
-            for stack_trace, count in stack_trace_counts.most_common():
-                f.write(f"A total of {count} threads were in the following state:\n")
-                f.write(stack_trace)
-                f.write("\n\n")
-        os._exit(1)
 
 
 class HttpxBenchmark(BaseBenchmark):
@@ -483,20 +522,25 @@ class HttpxTrioBenchmark(HttpxBenchmark, TrioBenchmark):
     pass
 
 
-class HttpxMsBenchmark(HttpxBenchmark):
-    async def set_up_client(self):
-        import httpcore_ms
+@contextmanager
+def monkey_patch_httpcore():
+    import httpcore_ms
 
-        self.old_httpcore = sys.modules.get("httpcore")
-        sys.modules["httpcore"] = httpcore_ms
-        self.exit_stack.callback(self.un_monkey_patch_httpcore)
-        await super().set_up_client()
-
-    def un_monkey_patch_httpcore(self):
-        if self.old_httpcore:
-            sys.modules["httpcore"] = self.old_httpcore
+    old_httpcore = sys.modules.get("httpcore")
+    sys.modules["httpcore"] = httpcore_ms
+    try:
+        yield
+    finally:
+        if old_httpcore:
+            sys.modules["httpcore"] = old_httpcore
         else:
             del sys.modules["httpcore"]
+
+
+class HttpxMsBenchmark(HttpxBenchmark):
+    async def set_up_client(self):
+        self.exit_stack.enter_context(monkey_patch_httpcore())
+        await super().set_up_client()
 
 
 class HttpxMsAsyncioBenchmark(HttpxMsBenchmark, AsyncioBenchmark):
@@ -509,6 +553,12 @@ class HttpxMsUvloopBenchmark(HttpxMsBenchmark, UvloopBenchmark):
 
 class HttpxMsTrioBenchmark(HttpxMsBenchmark, TrioBenchmark):
     pass
+
+
+class HttpxMsSyncBenchmark(HttpxSyncBenchmark):
+    async def set_up_client(self):
+        self.exit_stack.enter_context(monkey_patch_httpcore())
+        await super().set_up_client()
 
 
 class HttpxPyreqwestBenchmark(HttpxBenchmark, AsyncioBenchmark):
@@ -946,6 +996,8 @@ TEST_CLASSES = {
     "httpx_ms_asyncio": HttpxMsAsyncioBenchmark,
     "httpx_ms_uvloop": HttpxMsUvloopBenchmark,
     "httpx_ms_trio": HttpxMsTrioBenchmark,
+    "httpx_ms_sync": HttpxMsSyncBenchmark,
+    "httpx_ms_threaded": HttpxMsSyncBenchmark,
     "httpx_pyreqwest": HttpxPyreqwestBenchmark,
     "httpx_pyreqwest_uvloop": HttpxPyreqwestUvloopBenchmark,
     "httpx_pyreqwest_sync": HttpxPyreqwestSyncBenchmark,
@@ -1031,7 +1083,7 @@ def run_server(
             )
     with open("results/server.log", "wb") as log_file:
         # Kill any left over from previous runs
-        subprocess.run(["pkill", cmd[0]], check=False)
+        subprocess.run(["pkill", "-f", cmd[0]], check=False)
         process = subprocess.Popen(cmd, stdout=log_file, stderr=log_file)
         for _ in range(10):
             try:
@@ -1043,6 +1095,9 @@ def run_server(
         else:
             process.terminate()
             raise RuntimeError("Server failed to start")
+
+        assert process.poll() is None, "Server process exited prematurely"
+
         try:
             yield base_url
         finally:

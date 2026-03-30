@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 from collections import Counter, defaultdict
 from collections.abc import Generator, Iterable
@@ -33,12 +34,24 @@ PERCENTILES = (25, 50, 75, 90, 95, 99)
 
 
 @dataclass
+class ResourceStats:
+    timestamp: float
+    user_cpu_time_percent: float
+    system_cpu_time_percent: float
+    voluntary_context_switches_per_sec: float
+    involuntary_context_switches_per_sec: float
+    memory_rss: int
+    memory_vms: int
+
+
+@dataclass
 class BenchmarkResult:
     endpoint: str
     server_type: str
     client_under_test: str
     binned_results: list[BinnedResult]
     top_failure_messages: dict[str, int]
+    resource_stats: list[ResourceStats]
 
     def latency_at_rps(self, rps: float) -> float:
         for result in self.binned_results:
@@ -55,9 +68,11 @@ class BenchmarkResult:
 
     @property
     def breaking_point(self) -> float:
+        max_throughput_so_far = 0.0
         for result in self.binned_results:
+            max_throughput_so_far = max(max_throughput_so_far, result.throughput)
             if result.failure_count > 0.05 * result.success_count:
-                return result.throughput
+                return max_throughput_so_far
         else:
             return self.max_throughput
 
@@ -70,6 +85,7 @@ def read_and_bin_data(filename: str, bin_size: float = 1.0) -> BenchmarkResult:
     failures_by_time = Counter[float]()
     failures_by_message = Counter[str]()
     delay_counts = Counter[float]()
+    resource_stats: list[ResourceStats] = []
     with open(filename, "r") as file_:
         for row in file_:
             type_, timestamp, data = row.strip().split(",", 2)
@@ -83,6 +99,10 @@ def read_and_bin_data(filename: str, bin_size: float = 1.0) -> BenchmarkResult:
                     failures_by_message[data] += 1
                 case "delay":
                     delay_counts[time_bin] += 1
+                case "resource_stats":
+                    resource_stats.append(
+                        ResourceStats(timestamp=float(timestamp), **json.loads(data))
+                    )
 
     binned_results = []
     for time_bin in sorted(set(successes) | set(failures_by_time) | set(delay_counts)):
@@ -115,6 +135,7 @@ def read_and_bin_data(filename: str, bin_size: float = 1.0) -> BenchmarkResult:
         client_under_test=client_under_test,
         binned_results=binned_results,
         top_failure_messages=dict(failures_by_message.most_common(10)),
+        resource_stats=resource_stats,
     )
 
 
@@ -122,6 +143,9 @@ class PerBenchmarkGraphs(TypedDict):
     success_failure: pygal.TimeDeltaLine
     average_latency: pygal.TimeDeltaLine
     latency_percentiles: pygal.TimeDeltaLine
+    cpu_graph: pygal.TimeDeltaLine
+    memory_graph: pygal.TimeDeltaLine
+    context_switch_graph: pygal.TimeDeltaLine
 
 
 def get_time_bins(benchmark_results: Iterable[BenchmarkResult]) -> list[float]:
@@ -174,6 +198,23 @@ def get_test_end_time(benchmark_results: Iterable[BenchmarkResult]) -> float:
     return last_bin if last_bin is not None else 0.0
 
 
+def make_success_failure_graph(results: list[BinnedResult]) -> pygal.TimeDeltaLine:
+    graph = pygal.TimeDeltaLine(title="Success and Failure Counts Over Time")
+    graph.add(
+        "Successes",
+        [(result.time_bin, result.success_count) for result in results],
+    )
+    graph.add(
+        "Failures",
+        [(result.time_bin, result.failure_count) for result in results],
+    )
+    graph.add(
+        "Delays",
+        [(result.time_bin, result.delay_count) for result in results],
+    )
+    return graph
+
+
 def produce_per_benchmark_graphs(
     benchmark_result: BenchmarkResult,
 ) -> PerBenchmarkGraphs:
@@ -184,28 +225,7 @@ def produce_per_benchmark_graphs(
         if result.time_bin <= end_time
     ]
 
-    success_failure_graph = pygal.TimeDeltaLine(
-        title="Success and Failure Counts Over Time"
-    )
-
-    success_failure_graph.add(
-        "Successes",
-        [
-            (result.time_bin, result.success_count)
-            for result in truncated_binned_results
-        ],
-    )
-    success_failure_graph.add(
-        "Failures",
-        [
-            (result.time_bin, result.failure_count)
-            for result in truncated_binned_results
-        ],
-    )
-    success_failure_graph.add(
-        "Delays",
-        [(result.time_bin, result.delay_count) for result in truncated_binned_results],
-    )
+    success_failure_graph = make_success_failure_graph(truncated_binned_results)
 
     latency_graph = pygal.TimeDeltaLine(title="Average Latency Over Time")
     latency_graph.add(
@@ -227,10 +247,60 @@ def produce_per_benchmark_graphs(
             ],
         )
 
+    truncated_resource_stats = [
+        stat for stat in benchmark_result.resource_stats if stat.timestamp <= end_time
+    ]
+    cpu_graph = pygal.TimeDeltaLine(title="CPU Usage Over Time")
+    cpu_graph.add(
+        "User CPU Time %",
+        [
+            (stat.timestamp, stat.user_cpu_time_percent)
+            for stat in truncated_resource_stats
+        ],
+    )
+    cpu_graph.add(
+        "System CPU Time %",
+        [
+            (stat.timestamp, stat.system_cpu_time_percent)
+            for stat in truncated_resource_stats
+        ],
+    )
+
+    memory_graph = pygal.TimeDeltaLine(title="Memory Usage Over Time", human_readable=True)
+    memory_graph.add(
+        "Memory Usage RSS",
+        [(stat.timestamp, stat.memory_rss) for stat in truncated_resource_stats],
+    )
+    memory_graph.add(
+        "Memory Usage VMS",
+        [(stat.timestamp, stat.memory_vms) for stat in truncated_resource_stats],
+    )
+
+    context_switch_graph = pygal.TimeDeltaLine(
+        title="Context Switches Per Second Over Time"
+    )
+    context_switch_graph.add(
+        "Voluntary Context Switches/s",
+        [
+            (stat.timestamp, stat.voluntary_context_switches_per_sec)
+            for stat in truncated_resource_stats
+        ],
+    )
+    context_switch_graph.add(
+        "Involuntary Context Switches/s",
+        [
+            (stat.timestamp, stat.involuntary_context_switches_per_sec)
+            for stat in truncated_resource_stats
+        ],
+    )
+
     return {
         "success_failure": success_failure_graph,
         "average_latency": latency_graph,
         "latency_percentiles": percentile_graph,
+        "cpu_graph": cpu_graph,
+        "memory_graph": memory_graph,
+        "context_switch_graph": context_switch_graph,
     }
 
 
@@ -262,7 +332,7 @@ def produce_per_server_endpoint_graphs(
     def _make_graph(
         title: str, value_extractor: Callable[[BinnedResult], float]
     ) -> pygal.TimeDeltaLine:
-        graph = pygal.TimeDeltaLine(title=title)
+        graph = pygal.TimeDeltaLine(title=title, width=1500, height=1000)
         for benchmark_result in sorted(
             benchmark_results, key=lambda r: r.client_under_test
         ):
@@ -300,8 +370,8 @@ def produce_per_server_endpoint_graphs(
 
 
 class PerServerTypeGraphs(TypedDict):
-    breaking_point: pygal.Bar
-    max_throughput: pygal.Bar
+    breaking_point: pygal.HorizontalBar
+    max_throughput: pygal.HorizontalBar
 
 
 def produce_per_server_type_graphs(
@@ -316,8 +386,10 @@ def produce_per_server_type_graphs(
 
     def _make_graph(
         title: str, value_extractor: Callable[[BenchmarkResult], float]
-    ) -> pygal.Bar:
-        graph = pygal.Bar(title=title, x_labels=endpoints)
+    ) -> pygal.HorizontalBar:
+        graph = pygal.HorizontalBar(
+            title=title, x_labels=endpoints, width=1500, height=2000
+        )
         for client in clients:
             graph.add(
                 client,
@@ -401,11 +473,11 @@ def write_report(
 
             with tag("p"):
                 w(
-                    f"<object data='graphs/{server_type}_breaking_point.svg' width='800' height='600' type='image/svg+xml'></object>"
+                    f"<object data='graphs/{server_type}_breaking_point.svg' width='1500' height='2000' type='image/svg+xml'></object>"
                 )
             with tag("p"):
                 w(
-                    f"<object data='graphs/{server_type}_max_throughput.svg' width='800' height='600' type='image/svg+xml'></object>"
+                    f"<object data='graphs/{server_type}_max_throughput.svg' width='1500' height='2000' type='image/svg+xml'></object>"
                 )
 
             with tag("table", border="1", cellspacing="0", cellpadding="5"):
@@ -436,7 +508,9 @@ def write_report(
                             w(f"<td>{client_under_test}</td>")
                             for endpoint in endpoints:
                                 endpoint_max_throughput = max_max_throughputs[endpoint]
-                                min_latency_at_rps = min_latencies_at_rps[endpoint]
+                                min_latency_at_rps = max(
+                                    min_latencies_at_rps[endpoint], 0.0001
+                                )
                                 max_latency_at_rps = max_latencies_at_rps[endpoint]
                                 result = results_lookup.get(
                                     (server_type, endpoint, client_under_test)
@@ -448,11 +522,15 @@ def write_report(
                                             latency_at_rps = result.latency_at_rps(
                                                 rps_for_latency
                                             )
-                                            latency_goodness = 1 - log(
-                                                latency_at_rps / min_latency_at_rps
-                                            ) / log(
-                                                max_latency_at_rps / min_latency_at_rps
-                                            )
+                                            if latency_at_rps <= 0:
+                                                latency_goodness = 1.0
+                                            else:
+                                                latency_goodness = 1 - log(
+                                                    latency_at_rps / min_latency_at_rps
+                                                ) / log(
+                                                    max_latency_at_rps
+                                                    / min_latency_at_rps
+                                                )
                                         else:
                                             latency_goodness = 1.0
 

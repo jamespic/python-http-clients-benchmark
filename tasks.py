@@ -14,7 +14,7 @@ def serve(ctx: Context, ssl=True, http2=True):
 @task
 def generate_tls_certs(ctx: Context):
     ctx.run(
-        'openssl req -x509 -new -nodes -keyout ca.key -out ca.crt -subj "/CN=Fake CA" -addext "keyUsage=critical,digitalSignature,keyCertSign"'
+        'openssl req -x509 -new -nodes -keyout ca.key -out ca.crt -subj "/CN=Fake CA" -addext "keyUsage=critical,digitalSignature,keyCertSign" --days 36500'
     )
     ctx.run(
         "openssl req -new -newkey rsa:2048 -nodes -keyout server.key -out server.csr "
