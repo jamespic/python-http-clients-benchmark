@@ -1,8 +1,34 @@
 import datetime
 from argparse import ArgumentParser
-from subprocess import run
+from subprocess import Popen
 
 from benchmark import ENDPOINTS, TEST_CLASSES, ServerTypes
+
+TERMINATION_GRACE_PERIOD_SECONDS = 60  # Give it a minute to clean up after killing the process tree before forcefully terminating any remaining processes
+
+
+def kill_tree(pid):
+    import psutil
+
+    parent = psutil.Process(pid)
+    for child in reversed(parent.children(recursive=True)):
+        child.kill()
+    parent.kill()
+
+
+def run_with_timeout(cmd, timeout_seconds, check=False):
+    proc = Popen(cmd)
+    try:
+        result = proc.wait(timeout=timeout_seconds)
+        if check and result != 0:
+            raise RuntimeError(
+                f"Command '{' '.join(cmd)}' failed with exit code {result}"
+            )
+    except Exception:
+        kill_tree(proc.pid)
+        if check:
+            raise
+
 
 if __name__ == "__main__":
     argparser = ArgumentParser()
@@ -21,7 +47,7 @@ if __name__ == "__main__":
     argparser.add_argument(
         "--final-rate",
         type=float,
-        default=600.0,
+        default=1800.0,
         help="Final request rate for benchmarks (in requests per second)",
     )
     argparser.add_argument(
@@ -48,13 +74,13 @@ if __name__ == "__main__":
     )
     print()
 
-    for endpoint in ENDPOINTS:
-        for server_type in ServerTypes:
+    for server_type in ServerTypes:
+       for endpoint in ENDPOINTS:
             for test_class in TEST_CLASSES:
                 msg = f"Testing {test_class} against {server_type} ({endpoint})"
                 print(msg)
                 print("-" * len(msg))
-                run(
+                run_with_timeout(
                     [
                         "python",
                         "benchmark.py",
@@ -80,5 +106,6 @@ if __name__ == "__main__":
                         ),
                     ],
                     check=args.stop_on_error,
+                    timeout_seconds=args.duration + TERMINATION_GRACE_PERIOD_SECONDS,
                 )
                 print()

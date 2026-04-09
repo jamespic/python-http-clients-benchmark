@@ -76,6 +76,20 @@ class BenchmarkResult:
         else:
             return self.max_throughput
 
+    @property
+    def peak_cpu(self) -> float:
+        return max(
+            (
+                stat.user_cpu_time_percent + stat.system_cpu_time_percent
+                for stat in self.resource_stats
+            ),
+            default=0.0,
+        )
+
+    @property
+    def peak_memory(self) -> int:
+        return max((stat.memory_rss for stat in self.resource_stats), default=0)
+
 
 def read_and_bin_data(filename: str, bin_size: float = 1.0) -> BenchmarkResult:
     client_under_test, endpoint, server_type = splitext(basename(filename))[0].rsplit(
@@ -202,15 +216,21 @@ def make_success_failure_graph(results: list[BinnedResult]) -> pygal.TimeDeltaLi
     graph = pygal.TimeDeltaLine(title="Success and Failure Counts Over Time")
     graph.add(
         "Successes",
-        [(result.time_bin, result.success_count) for result in results],
+        [
+            (result.time_bin, result.success_count / result.bin_size)
+            for result in results
+        ],
     )
     graph.add(
         "Failures",
-        [(result.time_bin, result.failure_count) for result in results],
+        [
+            (result.time_bin, result.failure_count / result.bin_size)
+            for result in results
+        ],
     )
     graph.add(
         "Delays",
-        [(result.time_bin, result.delay_count) for result in results],
+        [(result.time_bin, result.delay_count / result.bin_size) for result in results],
     )
     return graph
 
@@ -266,7 +286,9 @@ def produce_per_benchmark_graphs(
         ],
     )
 
-    memory_graph = pygal.TimeDeltaLine(title="Memory Usage Over Time", human_readable=True)
+    memory_graph = pygal.TimeDeltaLine(
+        title="Memory Usage Over Time", human_readable=True
+    )
     memory_graph.add(
         "Memory Usage RSS",
         [(stat.timestamp, stat.memory_rss) for stat in truncated_resource_stats],
@@ -558,11 +580,19 @@ def write_report(
                                                     f"Latency at {rps_for_latency} rps: {latency_at_rps:.3f} s"
                                                 )
                                             with tag("li"):
-                                                with tag(
+                                                w(f"Peak CPU: {result.peak_cpu:.2f}%")
+                                            with tag("li"):
+                                                w(
+                                                    f"Peak Memory: {result.peak_memory / (1024 * 1024):.2f} MB"
+                                                )
+                                            with (
+                                                tag("li"),
+                                                tag(
                                                     "a",
                                                     href=f"#details-{server_type}-{endpoint}-{client_under_test}",
-                                                ):
-                                                    w("Details")
+                                                ),
+                                            ):
+                                                w("Details")
                                     else:
                                         w("N/A")
         with tag("h2"):
@@ -580,12 +610,38 @@ def write_report(
                     w(f"Breaking Point: {result.breaking_point:.2f} rps")
                 with tag("p"):
                     w(f"Max Throughput: {result.max_throughput:.2f} rps")
+                with tag("p"):
+                    w(f"Peak CPU Usage: {result.peak_cpu:.2f}%")
+                with tag("p"):
+                    w(f"Peak Memory Usage: {result.peak_memory / (1024 * 1024):.2f} MB")
                 with tag("h4"):
                     w("Top Failure Messages")
                 with tag("ul"):
                     for message, count in result.top_failure_messages.items():
                         with tag("li"):
                             w(f"{message}: {count} occurrences")
+                if result.top_failure_messages:
+                    with (
+                        tag("p"),
+                        tag(
+                            "a",
+                            href=f"results/errors_{result.client_under_test}_{result.endpoint}_{result.server_type}.log",
+                        ),
+                    ):
+                        w("All Error Stack Traces")
+                if os.path.exists(
+                    f"results/hang_{result.client_under_test}_{result.endpoint}_{result.server_type}.log"
+                ):
+                    with (
+                        tag("p"),
+                        tag(
+                            "a",
+                            href=f"results/hang_{result.client_under_test}_{result.endpoint}_{result.server_type}.log",
+                        ),
+                    ):
+                        w(
+                            "This test failed to exit cleanly. View stack traces for hung threads."
+                        )
                 with tag("h4"):
                     w("Graphs")
                 with tag("ul"):
@@ -600,6 +656,18 @@ def write_report(
                     with tag("li"):
                         w(
                             f'<a href="graphs/{result.client_under_test}_{result.endpoint}_{result.server_type}_latency_percentiles.svg">Latency Percentiles</a>'
+                        )
+                    with tag("li"):
+                        w(
+                            f'<a href="graphs/{result.client_under_test}_{result.endpoint}_{result.server_type}_cpu_graph.svg">CPU Usage</a>'
+                        )
+                    with tag("li"):
+                        w(
+                            f'<a href="graphs/{result.client_under_test}_{result.endpoint}_{result.server_type}_memory_graph.svg">Memory Usage</a>'
+                        )
+                    with tag("li"):
+                        w(
+                            f'<a href="graphs/{result.client_under_test}_{result.endpoint}_{result.server_type}_context_switch_graph.svg">Context Switches</a>'
                         )
         w("</body></html>")
 

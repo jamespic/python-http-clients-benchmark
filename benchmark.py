@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from enum import StrEnum
-from logging import DEBUG, INFO, basicConfig, getLogger
+from logging import DEBUG, INFO, basicConfig, getLogger, ERROR
 from math import sqrt
 from pathlib import Path
 from random import Random
@@ -602,6 +602,27 @@ class HttpxPyreqwestSyncBenchmark(HttpxSyncBenchmark):
             )
         )
 
+class HttpxPyreqwestThreadedBenchmark(HttpxPyreqwestSyncBenchmark):
+    def make_client(self) -> httpx.Client:
+        pyreqwest_client = self.exit_stack.enter_context(
+            pyreqwest.client.SyncClientBuilder()
+            .add_root_certificate_pem(server_ca_cert_pem)
+            .timeout(datetime.timedelta(seconds=self._timeout))
+            .max_connections(MAX_CONNECTION_POOL_SIZE)
+            .http2(True)
+            .http2_adaptive_window(True)
+            # Pyreqwest's threaded mode isn't exactly the same as nogil since it's config for Tokio
+            # rather than Python, but it seem likely users who are using nogil will
+            # also use Pyreqwest's threaded mode, so we want to include it in the benchmark suite anyway
+            .runtime_multithreaded(True)
+            .build()
+        )
+        return self.exit_stack.enter_context(
+            httpx.Client(
+                transport=SyncHttpxPyreqwestTransport(pyreqwest_client),
+                timeout=self._timeout,
+            )
+        )
 
 class AiohttpHttpxTransportBenchmark(HttpxBenchmark, AsyncioBenchmark):
     async def make_client(self):
@@ -694,6 +715,23 @@ class PyreqwestSyncBenchmark(SynchronousBenchmark):
                 assert content is not None
                 self.check_content_length(content)
 
+
+class PyreqwestThreadedBenchmark(PyreqwestSyncBenchmark):
+    async def set_up_client(self):
+        self._client = self.exit_stack.enter_context(
+            pyreqwest.client.SyncClientBuilder()
+            .add_root_certificate_pem(server_ca_cert_pem)
+            .timeout(datetime.timedelta(seconds=self._timeout))
+            .max_connections(MAX_CONNECTION_POOL_SIZE)
+            .http2(True)
+            .http2_adaptive_window(True)
+            .error_for_status(True)
+            # Pyreqwest's threaded mode isn't exactly the same as nogil since it's config for Tokio
+            # rather than Python, but it seem likely users who are using nogil will
+            # also use Pyreqwest's threaded mode, so we want to include it in the benchmark suite anyway
+            .runtime_multithreaded(True)
+            .build()
+        )
 
 class AiohttpBenchmark(AsyncioBenchmark):
     async def set_up_client(self):
@@ -1001,13 +1039,13 @@ TEST_CLASSES = {
     "httpx_pyreqwest": HttpxPyreqwestBenchmark,
     "httpx_pyreqwest_uvloop": HttpxPyreqwestUvloopBenchmark,
     "httpx_pyreqwest_sync": HttpxPyreqwestSyncBenchmark,
-    "httpx_pyreqwest_threaded": HttpxPyreqwestSyncBenchmark,
+    "httpx_pyreqwest_threaded": HttpxPyreqwestThreadedBenchmark,
     "httpx_aiohttp": AiohttpHttpxTransportBenchmark,
     "httpx_aiohttp_uvloop": AiohttpHttpsTransportUvloopBenchmark,
     "pyreqwest": PyreqwestBenchmark,
     "pyreqwest_uvloop": PyreqwestUvloopBenchmark,
     "pyreqwest_sync": PyreqwestSyncBenchmark,
-    "pyreqwest_threaded": PyreqwestSyncBenchmark,
+    "pyreqwest_threaded": PyreqwestThreadedBenchmark,
     "aiohttp": AiohttpBenchmark,
     "aiohttp_uvloop": AiohttpUvloopBenchmark,
     "niquests": NiquestsBenchmark,
@@ -1188,7 +1226,10 @@ if __name__ == "__main__":
     if args.enable_logging or args.debug:
         basicConfig(
             filename=f"results/{args.test_class}_{args.endpoint}_{args.server_type}.log",
-            level=DEBUG if args.debug else INFO,
+            # Whilst INFO is probably more representative of what most applications would run in production than ERROR,
+            # INFO ends up unfairly penalizing HTTPX, since it's the only client that by default logs all
+            # requests at INFO level, whereas the other clients only log errors, or don't log at all.
+            level=DEBUG if args.debug else ERROR,
         )
 
     expect_threaded = args.test_class.endswith("_threaded")
