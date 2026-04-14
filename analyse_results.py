@@ -444,7 +444,7 @@ def produce_per_server_type_graphs(
 def write_report(
     benchmark_results: Iterable[BenchmarkResult],
     filename: str = "report.html",
-    rps_for_latency: float = 500.0,
+    rps_for_latency: float = 100.0,
 ) -> None:
     with open(filename, "w") as file_:
         indent = 0
