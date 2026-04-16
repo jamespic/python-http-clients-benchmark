@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from enum import StrEnum
-from logging import DEBUG, INFO, basicConfig, getLogger, ERROR
+from logging import DEBUG, ERROR, basicConfig, getLogger
 from math import sqrt
 from pathlib import Path
 from random import Random
@@ -468,8 +468,8 @@ class HttpxBenchmark(BaseBenchmark):
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError:
-            # 404 is the only status we expect in the test, everything else is an error
-            assert response.status_code == 404
+            # 418 is the only status we expect in the test, everything else is an error
+            assert response.status_code == 418
         else:
             assert response.status_code == 200
         if response.headers["Content-Type"] == "application/json":
@@ -508,8 +508,8 @@ class HttpxSyncBenchmark(SynchronousBenchmark):
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError:
-            # 404 is the only status we expect in the test, everything else is an error
-            assert response.status_code == 404
+            # 418 is the only status we expect in the test, everything else is an error
+            assert response.status_code == 418
         else:
             assert response.status_code == 200
         if response.headers["Content-Type"] == "application/json":
@@ -602,6 +602,7 @@ class HttpxPyreqwestSyncBenchmark(HttpxSyncBenchmark):
             )
         )
 
+
 class HttpxPyreqwestThreadedBenchmark(HttpxPyreqwestSyncBenchmark):
     def make_client(self) -> httpx.Client:
         pyreqwest_client = self.exit_stack.enter_context(
@@ -623,6 +624,7 @@ class HttpxPyreqwestThreadedBenchmark(HttpxPyreqwestSyncBenchmark):
                 timeout=self._timeout,
             )
         )
+
 
 class AiohttpHttpxTransportBenchmark(HttpxBenchmark, AsyncioBenchmark):
     async def make_client(self):
@@ -666,8 +668,8 @@ class PyreqwestBenchmark(AsyncioBenchmark):
             else:
                 response = await self._client.get(self._url).build().send()
         except StatusError as e:
-            # 404 is the only status we expect in the test, everything else is an error
-            assert e.details["status"] == 404
+            # 418 is the only status we expect in the test, everything else is an error
+            assert e.details["status"] == 418
             return
         else:
             assert response.status == 200
@@ -703,8 +705,8 @@ class PyreqwestSyncBenchmark(SynchronousBenchmark):
             else:
                 response = self._client.get(self._url).build().send()
         except StatusError as e:
-            # 404 is the only status we expect in the test, everything else is an error
-            assert e.details["status"] == 404
+            # 418 is the only status we expect in the test, everything else is an error
+            assert e.details["status"] == 418
             return
         else:
             assert response.status == 200
@@ -733,6 +735,7 @@ class PyreqwestThreadedBenchmark(PyreqwestSyncBenchmark):
             .build()
         )
 
+
 class AiohttpBenchmark(AsyncioBenchmark):
     async def set_up_client(self):
         self._client = await self.exit_stack.enter_async_context(
@@ -753,8 +756,8 @@ class AiohttpBenchmark(AsyncioBenchmark):
             try:
                 response.raise_for_status()
             except aiohttp.ClientResponseError as e:
-                # 404 is the only status we expect in the test, everything else is an error
-                assert e.status == 404
+                # 418 is the only status we expect in the test, everything else is an error
+                assert e.status == 418
             else:
                 assert response.status == 200
             if response.headers["Content-Type"] == "application/json":
@@ -784,9 +787,9 @@ class NiquestsBenchmark(AsyncioBenchmark):
         try:
             response.raise_for_status()
         except niquests.exceptions.RequestException as e:
-            # 404 is the only status we expect in the test, everything else is an error
+            # 418 is the only status we expect in the test, everything else is an error
             assert e.response is not None
-            assert e.response.status_code == 404
+            assert e.response.status_code == 418
         else:
             assert response.status_code == 200
         if response.headers["Content-Type"] == "application/json":
@@ -818,9 +821,9 @@ class NiquestsSyncBenchmark(SynchronousBenchmark):
         try:
             response.raise_for_status()
         except niquests.exceptions.RequestException as e:
-            # 404 is the only status we expect in the test, everything else is an error
+            # 418 is the only status we expect in the test, everything else is an error
             assert e.response is not None
-            assert e.response.status_code == 404
+            assert e.response.status_code == 418
         else:
             assert response.status_code == 200
         if response.headers["Content-Type"] == "application/json":
@@ -852,9 +855,9 @@ class RequestsBenchmark(SynchronousBenchmark):
         try:
             response.raise_for_status()
         except requests.HTTPError as e:
-            # 404 is the only status we expect in the test, everything else is an error
+            # 418 is the only status we expect in the test, everything else is an error
             assert e.response is not None
-            assert e.response.status_code == 404
+            assert e.response.status_code == 418
         else:
             assert response.status_code == 200
         if response.headers["Content-Type"] == "application/json":
@@ -1010,7 +1013,7 @@ class PyCurlBenchmark(AsyncioBenchmark):
         self._multi.add_handle(curl)
         try:
             await future
-            assert curl.getinfo(pycurl.RESPONSE_CODE) in (200, 404)
+            assert curl.getinfo(pycurl.RESPONSE_CODE) in (200, 418)
             if headers.get("content-type") == "application/json":
                 assert response is not None
                 json.loads(response)
@@ -1077,6 +1080,7 @@ class AsgiServer(StrEnum):
 def run_server(
     type_: ServerTypes = ServerTypes.HTTPS2,
     asgi_server: AsgiServer = AsgiServer.GRANIAN,
+    debug: bool = False,
 ) -> Iterator[str]:
     match asgi_server:
         case AsgiServer.GRANIAN:
@@ -1098,6 +1102,8 @@ def run_server(
                 "--port",
                 "8443",
             ]
+            if debug:
+                cmd += ["--log-level", "debug", "--access-log"]
             base_url = "https://localhost:8443"
             match type_:
                 case "https2":
@@ -1112,6 +1118,7 @@ def run_server(
                 "hypercorn",
                 "--config",
                 f"hypercorn_config/{type_}.toml",
+                *(["--log-level", "debug"] if debug else []),
                 "asgi:server:app",
             ]
             base_url = (
@@ -1157,9 +1164,9 @@ ENDPOINTS = {
     "hello": Endpoint("/hello", None),
     "json": Endpoint("/json", None),
     "chunked": Endpoint("/chunked", None),
-    "post": Endpoint("/post", {f"key{i}": ["value"] * 250 for i in range(250)}),
+    "post": Endpoint("/upload", {f"key{i}": ["value"] * 250 for i in range(250)}),
     "latency": Endpoint("/latency", None),
-    "notfound": Endpoint("/notfound", None),
+    "teapot": Endpoint("/teapot", None),
 }
 
 if __name__ == "__main__":
@@ -1284,7 +1291,7 @@ if __name__ == "__main__":
         )
 
     resource.setrlimit(resource.RLIMIT_NOFILE, (100000, 100000))
-    with run_server(args.server_type, args.asgi_server) as base_url:
+    with run_server(args.server_type, args.asgi_server, debug=args.debug) as base_url:
         endpoint = ENDPOINTS[args.endpoint]
         test_class = TEST_CLASSES[args.test_class]
         benchmark = test_class(

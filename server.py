@@ -143,12 +143,32 @@ async def handle_not_found(scope, receive, send):
         }
     )
 
+teapot = b"I'm a teapot"
+async def handle_teapot(scope, receive, send):
+    assert scope["type"] == "http"
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 418,
+            "headers": [
+                (b"content-type", b"text/plain"),
+            ],
+        }
+    )
+    await send(
+        {
+            "type": "http.response.body",
+            "body": teapot,
+        }
+    )
+
 
 possible_content_lengths = {
     len(hello_world),
     len(dummy_json),
     len(dummy_chunk) * chunk_count,
     len(not_found),
+    len(teapot)
 }
 
 
@@ -158,6 +178,7 @@ HANDLERS = {
     "/chunked": handle_chunked,
     "/latency": handle_latency,
     "/upload": handle_post,
+    "/teapot": handle_teapot,
 }
 
 
