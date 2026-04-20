@@ -314,7 +314,7 @@ class BaseBenchmark:
             self._logger.exception(f"Request failed with error: {error}")
 
     def _save_error_counts(self):
-        with open(f"results/errors_{self._test_name}.log", "w") as f:
+        with open(f"results/errors_{self._test_name}.txt", "w") as f:
             for error, count in self._errors_counter.most_common():
                 f.write(f"Count: {count}\n")
                 f.write(error)
@@ -353,7 +353,7 @@ class BaseBenchmark:
             file=sys.stderr,
         )
         with open(
-            f"results/hang_{self._test_name}.log",
+            f"results/hang_{self._test_name}.txt",
             "w",
         ) as f:
             stack_trace_counts = Counter()

@@ -625,18 +625,18 @@ def write_report(
                         tag("p"),
                         tag(
                             "a",
-                            href=f"results/errors_{result.client_under_test}_{result.endpoint}_{result.server_type}.log",
+                            href=f"results/errors_{result.client_under_test}_{result.endpoint}_{result.server_type}.txt",
                         ),
                     ):
                         w("All Error Stack Traces")
                 if os.path.exists(
-                    f"results/hang_{result.client_under_test}_{result.endpoint}_{result.server_type}.log"
+                    f"results/hang_{result.client_under_test}_{result.endpoint}_{result.server_type}.txt"
                 ):
                     with (
                         tag("p"),
                         tag(
                             "a",
-                            href=f"results/hang_{result.client_under_test}_{result.endpoint}_{result.server_type}.log",
+                            href=f"results/hang_{result.client_under_test}_{result.endpoint}_{result.server_type}.txt",
                         ),
                     ):
                         w(
