@@ -1,4 +1,5 @@
 import argparse
+import io
 import json
 import os
 from collections import Counter, defaultdict
@@ -441,26 +442,33 @@ def produce_per_server_type_graphs(
     }
 
 
+class HtmlWriter:
+    def __init__(self, file_: io.TextIOBase):
+        self.file_ = file_
+        self.indent = 0
+
+    @contextmanager
+    def tag(self, tag_name: str, **attrs) -> Generator[None, None, None]:
+        attr_str = " ".join(f'{key}="{value}"' for key, value in attrs.items())
+        self.file_.write(f"{' ' * self.indent}<{tag_name} {attr_str}>\n")
+        self.indent += 2
+        yield
+        self.indent -= 2
+        self.file_.write(f"{' ' * self.indent}</{tag_name}>\n")
+
+    def w(self, text: str) -> None:
+        self.file_.write(" " * self.indent + text + "\n")
+
+
 def write_report(
     benchmark_results: Iterable[BenchmarkResult],
     filename: str = "report.html",
     rps_for_latency: float = 100.0,
 ) -> None:
     with open(filename, "w") as file_:
-        indent = 0
-
-        @contextmanager
-        def tag(tag_name: str, **attrs) -> Generator[None, None, None]:
-            nonlocal indent
-            attr_str = " ".join(f'{key}="{value}"' for key, value in attrs.items())
-            file_.write(f"{' ' * indent}<{tag_name} {attr_str}>\n")
-            indent += 2
-            yield
-            indent -= 2
-            file_.write(f"{' ' * indent}</{tag_name}>\n")
-
-        def w(text: str) -> None:
-            file_.write(" " * indent + text + "\n")
+        writer = HtmlWriter(file_)
+        tag = writer.tag
+        w = writer.w
 
         w("<html><head><title>Benchmark Report</title></head><body>")
         w("<h1>Benchmark Report</h1>")
@@ -596,6 +604,45 @@ def write_report(
                                     else:
                                         w("N/A")
         with tag("h2"):
+            w("Versus")
+        clients = sorted(set(result.client_under_test for result in benchmark_results))
+
+        with tag("form"):
+            w("Select two clients to compare: ")
+            with tag("select", id="versus-client1"):
+                for client in clients:
+                    w(f'<option value="{client}">{client}</option>')
+            with tag("select", id="versus-client2"):
+                for client in clients:
+                    w(f'<option value="{client}">{client}</option>')
+            with tag("a", id="versus-link", href="#"):
+                w("Compare")
+            with tag("script"):
+                w(
+                    """
+                    let client1Select = document.getElementById('versus-client1');
+                    let client2Select = document.getElementById('versus-client2');
+                    let versusLink = document.getElementById('versus-link');
+                    let client1 = client1Select.value;
+                    let client2 = client2Select.value;
+                    function maybeEnableLink() {
+                        if (client1 && client2) {
+                            versusLink.href = `versus/${client1}_vs_${client2}.html`;
+                        } else {
+                            versusLink.href = "#";
+                        }
+                    }
+                    client1Select.addEventListener('change', () => {
+                        client1 = client1Select.value;
+                        maybeEnableLink();
+                    });
+                    client2Select.addEventListener('change', () => {
+                        client2 = client2Select.value;
+                        maybeEnableLink();
+                    });
+                    """
+                )
+        with tag("h2"):
             w("Detailed Results")
         for result in benchmark_results:
             with tag(
@@ -679,6 +726,194 @@ def choose_colour_bad_to_good(value: float) -> str:
     return f"rgb({red}, {green}, 0)"
 
 
+@dataclass(frozen=True, order=True)
+class ServerAndEndpoint:
+    server_type: str
+    endpoint: str
+
+
+type VersusGraphs = PerServerTypeGraphs
+
+
+def produce_versus_graphs(
+    client1: str, client2: str, benchmark_results: Iterable[BenchmarkResult]
+) -> VersusGraphs:
+    results_by_client_and_endpoint_server_combo = {
+        (
+            result.client_under_test,
+            ServerAndEndpoint(result.server_type, result.endpoint),
+        ): result
+        for result in benchmark_results
+    }
+    clients = sorted([client1, client2])
+    server_endpoint_combos = sorted(
+        set(
+            ServerAndEndpoint(result.server_type, result.endpoint)
+            for result in benchmark_results
+        )
+    )
+
+    def _make_graph(
+        title: str, value_extractor: Callable[[BenchmarkResult], float]
+    ) -> pygal.HorizontalBar:
+        graph = pygal.HorizontalBar(
+            title=title,
+            x_labels=[
+                f"{combo.server_type} - {combo.endpoint}"
+                for combo in server_endpoint_combos
+            ],
+            width=1500,
+            height=2000,
+        )
+        for client in clients:
+            graph.add(
+                client,
+                [
+                    (
+                        value_extractor(result)
+                        if (
+                            result := results_by_client_and_endpoint_server_combo.get(
+                                (client, server_endpoint_combo)
+                            )
+                        )
+                        else 0.0
+                    )
+                    for server_endpoint_combo in server_endpoint_combos
+                ],
+            )
+        return graph
+
+    return {
+        "breaking_point": _make_graph(
+            "Breaking Point (Throughput where failures breach 5%)",
+            lambda result: result.breaking_point,
+        ),
+        "max_throughput": _make_graph(
+            "Maximum Throughput Achieved", lambda result: result.max_throughput
+        ),
+    }
+
+
+def produce_versus_report(
+    client1: str, client2: str, benchmark_results: Iterable[BenchmarkResult]
+) -> None:
+    os.makedirs("versus", exist_ok=True)
+    with open(f"versus/{client1}_vs_{client2}.html", "w") as file_:
+        writer = HtmlWriter(file_)
+        tag = writer.tag
+        w = writer.w
+
+        w(f"<html><head><title>{client1} vs {client2}</title></head><body>")
+        with tag("h1"):
+            w(f"{client1} vs {client2}")
+        graphs = produce_versus_graphs(client1, client2, benchmark_results)
+        graphs = cast(dict[str, pygal.Graph], graphs)
+        for graph_name, graph in graphs.items():
+            with tag("h3"):
+                w(graph_name.replace("_", " ").title())
+            filename = f"{client1}_vs_{client2}_{graph_name}.svg"
+            graph.render_to_file(f"versus/{filename}")
+            with tag("p"):
+                w(
+                    f'<object data="{filename}" width="1500" height="2000" type="image/svg+xml"></object>'
+                )
+
+        with tag("h2"):
+            w("Results Table")
+
+        server_endpoint_combos = sorted(
+            ServerAndEndpoint(result.server_type, result.endpoint)
+            for result in benchmark_results
+            if result.client_under_test in {client1, client2}
+        )
+        with tag("table", border="1", cellspacing="0", cellpadding="5"):
+            with tag("tr"):
+                w("<th>Server Type</th><th>Endpoint</th>")
+                w(f"<th>{client1} Breaking Point (rps)</th>")
+                w(f"<th>{client2} Breaking Point (rps)</th>")
+                w(f"<th>{client1} Max Throughput (rps)</th>")
+                w(f"<th>{client2} Max Throughput (rps)</th>")
+                w(f"<th>{client1} Latency at 100 rps (s)</th>")
+                w(f"<th>{client2} Latency at 100 rps (s)</th>")
+            for combo in server_endpoint_combos:
+                client1_result = next(
+                    (
+                        result
+                        for result in benchmark_results
+                        if result.client_under_test == client1
+                        and result.server_type == combo.server_type
+                        and result.endpoint == combo.endpoint
+                    ),
+                    None,
+                )
+                client2_result = next(
+                    (
+                        result
+                        for result in benchmark_results
+                        if result.client_under_test == client2
+                        and result.server_type == combo.server_type
+                        and result.endpoint == combo.endpoint
+                    ),
+                    None,
+                )
+                if client1_result and client2_result:
+                    with tag("tr"):
+                        overall_max_throughput = max(
+                            client1_result.max_throughput, client2_result.max_throughput
+                        )
+                        client1_latency_at_rps = client1_result.latency_at_rps(100.0)
+                        client2_latency_at_rps = client2_result.latency_at_rps(100.0)
+                        min_latency_at_rps = min(
+                            client1_latency_at_rps, client2_latency_at_rps
+                        )
+                        client1_latency_goodness = (
+                            (min_latency_at_rps / client1_latency_at_rps)
+                            if client1_latency_at_rps > 0
+                            else 1.0
+                        )
+                        client2_latency_goodness = (
+                            (min_latency_at_rps / client2_latency_at_rps)
+                            if client2_latency_at_rps > 0
+                            else 1.0
+                        )
+                        w(f"<td>{combo.server_type}</td><td>{combo.endpoint}</td>")
+                        w(
+                            f'<td style="color: {choose_colour_bad_to_good(client1_result.breaking_point / overall_max_throughput if overall_max_throughput > 0 else 0.0)}">{client1_result.breaking_point:.2f}</td>'
+                        )
+                        w(
+                            f'<td style="color: {choose_colour_bad_to_good(client2_result.breaking_point / overall_max_throughput if overall_max_throughput > 0 else 0.0)}">{client2_result.breaking_point:.2f}</td>'
+                        )
+                        w(
+                            f'<td style="color: {choose_colour_bad_to_good(client1_result.max_throughput / overall_max_throughput if overall_max_throughput > 0 else 0.0)}">{client1_result.max_throughput:.2f}</td>'
+                        )
+                        w(
+                            f'<td style="color: {choose_colour_bad_to_good(client2_result.max_throughput / overall_max_throughput if overall_max_throughput > 0 else 0.0)}">{client2_result.max_throughput:.2f}</td>'
+                        )
+                        w(
+                            f'<td style="color: {choose_colour_bad_to_good(client1_latency_goodness)}">{client1_latency_at_rps:.3f}</td>'
+                        )
+                        w(
+                            f'<td style="color: {choose_colour_bad_to_good(client2_latency_goodness)}">{client2_latency_at_rps:.3f}</td>'
+                        )
+
+        w("</body></html>")
+
+
+def produce_all_versus_reports(benchmark_results: Iterable[BenchmarkResult]) -> None:
+    clients = sorted(set(result.client_under_test for result in benchmark_results))
+    tasks = []
+    with ThreadPoolExecutor() as executor:
+        for i, client1 in enumerate(clients):
+            for j in range(i + 1, len(clients)):
+                tasks.append(
+                    executor.submit(
+                        produce_versus_report, client1, clients[j], benchmark_results
+                    )
+                )
+        for task in tasks:
+            task.result()
+
+
 def main(bin_size: float = 1.0) -> None:
     with ThreadPoolExecutor() as executor:
         benchmark_results: list[BenchmarkResult] = list(
@@ -693,20 +928,29 @@ def main(bin_size: float = 1.0) -> None:
         )
         list(executor.map(save_per_benchmark_graphs, benchmark_results))
 
-    grouped_by_server_endpoint = defaultdict[tuple[str, str], list[BenchmarkResult]](
+    grouped_by_server_endpoint = defaultdict[ServerAndEndpoint, list[BenchmarkResult]](
         list
     )
     for result in benchmark_results:
-        grouped_by_server_endpoint[(result.server_type, result.endpoint)].append(result)
-    for (server, endpoint), group in grouped_by_server_endpoint.items():
+        grouped_by_server_endpoint[
+            ServerAndEndpoint(result.server_type, result.endpoint)
+        ].append(result)
+    for combo, group in grouped_by_server_endpoint.items():
         graphs = cast(
             dict[str, pygal.Graph],
-            produce_per_server_endpoint_graphs(server, endpoint, group),
+            produce_per_server_endpoint_graphs(
+                combo.server_type, combo.endpoint, group
+            ),
         )
         for graph_name, graph in graphs.items():
-            graph.render_to_file(f"graphs/{endpoint}_{server}_{graph_name}.svg")
+            graph.render_to_file(
+                f"graphs/{combo.endpoint}_{combo.server_type}_{graph_name}.svg"
+            )
+
+    produce_all_versus_reports(benchmark_results)
 
     grouped_by_server_type = defaultdict[str, list[BenchmarkResult]](list)
+
     for result in benchmark_results:
         grouped_by_server_type[result.server_type].append(result)
     for server_type, group in grouped_by_server_type.items():

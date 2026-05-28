@@ -468,7 +468,7 @@ class HttpxBenchmark(BaseBenchmark):
             response = await self._client.get(self._url)
         try:
             response.raise_for_status()
-        except httpx.HTTPStatusError:
+        except (httpx.HTTPStatusError, httpxyz.HTTPStatusError):
             # 418 is the only status we expect in the test, everything else is an error
             assert response.status_code == 418
         else:
@@ -508,7 +508,7 @@ class HttpxSyncBenchmark(SynchronousBenchmark):
             response = self._client.get(self._url)
         try:
             response.raise_for_status()
-        except httpx.HTTPStatusError:
+        except (httpx.HTTPStatusError, httpxyz.HTTPStatusError):
             # 418 is the only status we expect in the test, everything else is an error
             assert response.status_code == 418
         else:
