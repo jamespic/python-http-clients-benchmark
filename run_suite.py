@@ -61,10 +61,17 @@ if __name__ == "__main__":
         type=int,
         help="If set, run benchmarks with _threaded in their name with a CPU quota",
     )
+    argparser.add_argument(
+        "--test-classes",
+        nargs="+",
+        default=TEST_CLASSES,
+        help="List of test classes to run (default: all)",
+        choices=TEST_CLASSES,
+    )
     args = argparser.parse_args()
 
     expected_duration = (
-        args.duration * len(ENDPOINTS) * len(ServerTypes) * len(TEST_CLASSES)
+        args.duration * len(ENDPOINTS) * len(ServerTypes) * len(args.test_classes)
     )
     expected_completion_time = datetime.datetime.now() + datetime.timedelta(
         seconds=expected_duration
@@ -75,8 +82,8 @@ if __name__ == "__main__":
     print()
 
     for server_type in ServerTypes:
-       for endpoint in ENDPOINTS:
-            for test_class in TEST_CLASSES:
+        for endpoint in ENDPOINTS:
+            for test_class in args.test_classes:
                 msg = f"Testing {test_class} against {server_type} ({endpoint})"
                 print(msg)
                 print("-" * len(msg))

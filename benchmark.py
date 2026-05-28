@@ -22,12 +22,13 @@ from pathlib import Path
 from random import Random
 from time import monotonic, perf_counter
 from types import ModuleType
-from typing import Iterator
+from typing import Iterator, cast
 from urllib.request import urlopen
 
 import aiohttp
 import httpx
 import httpx_aiohttp
+import httpxyz
 import niquests
 import psutil
 import pyreqwest.client
@@ -520,6 +521,48 @@ class HttpxSyncBenchmark(SynchronousBenchmark):
 
 class HttpxTrioBenchmark(HttpxBenchmark, TrioBenchmark):
     pass
+
+
+class HttpxyzBenchmark(HttpxBenchmark):
+    async def make_client(self) -> httpx.AsyncClient:
+        return await self.exit_stack.enter_async_context(
+            cast(
+                httpx.AsyncClient,  # Interface is the same, but the type checker doesn't know that
+                httpxyz.AsyncClient(
+                    http2=True,
+                    verify=ssl_context,
+                    timeout=self._timeout,
+                    limits=httpxyz.Limits(max_connections=MAX_CONNECTION_POOL_SIZE),
+                ),
+            )
+        )
+
+
+class HttpxyzAsyncioBenchmark(HttpxyzBenchmark, AsyncioBenchmark):
+    pass
+
+
+class HttpxyzUvloopBenchmark(HttpxyzBenchmark, UvloopBenchmark):
+    pass
+
+
+class HttpxyzTrioBenchmark(HttpxyzBenchmark, TrioBenchmark):
+    pass
+
+
+class HttpxyzSyncBenchmark(HttpxSyncBenchmark):
+    def make_client(self) -> httpx.Client:
+        return self.exit_stack.enter_context(
+            cast(
+                httpx.Client,  # Interface is the same, but the type checker doesn't know that
+                httpxyz.Client(
+                    http2=True,
+                    verify=ssl_context,
+                    timeout=self._timeout,
+                    limits=httpxyz.Limits(max_connections=MAX_CONNECTION_POOL_SIZE),
+                ),
+            )
+        )
 
 
 @contextmanager
@@ -1039,6 +1082,11 @@ TEST_CLASSES = {
     "httpx_ms_trio": HttpxMsTrioBenchmark,
     "httpx_ms_sync": HttpxMsSyncBenchmark,
     "httpx_ms_threaded": HttpxMsSyncBenchmark,
+    "httpxyz_asyncio": HttpxyzAsyncioBenchmark,
+    "httpxyz_uvloop": HttpxyzUvloopBenchmark,
+    "httpxyz_trio": HttpxyzTrioBenchmark,
+    "httpxyz_sync": HttpxyzSyncBenchmark,
+    "httpxyz_threaded": HttpxyzSyncBenchmark,
     "httpx_pyreqwest": HttpxPyreqwestBenchmark,
     "httpx_pyreqwest_uvloop": HttpxPyreqwestUvloopBenchmark,
     "httpx_pyreqwest_sync": HttpxPyreqwestSyncBenchmark,
