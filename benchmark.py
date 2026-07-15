@@ -27,8 +27,8 @@ from urllib.request import urlopen
 
 import aiohttp
 import httpx
+import httpx2
 import httpx_aiohttp
-import httpxyz
 import niquests
 import psutil
 import pyreqwest.client
@@ -468,7 +468,7 @@ class HttpxBenchmark(BaseBenchmark):
             response = await self._client.get(self._url)
         try:
             response.raise_for_status()
-        except (httpx.HTTPStatusError, httpxyz.HTTPStatusError):
+        except httpx.HTTPStatusError, httpx2.HTTPStatusError:
             # 418 is the only status we expect in the test, everything else is an error
             assert response.status_code == 418
         else:
@@ -508,7 +508,7 @@ class HttpxSyncBenchmark(SynchronousBenchmark):
             response = self._client.get(self._url)
         try:
             response.raise_for_status()
-        except (httpx.HTTPStatusError, httpxyz.HTTPStatusError):
+        except httpx.HTTPStatusError, httpx2.HTTPStatusError:
             # 418 is the only status we expect in the test, everything else is an error
             assert response.status_code == 418
         else:
@@ -528,11 +528,11 @@ class HttpxyzBenchmark(HttpxBenchmark):
         return await self.exit_stack.enter_async_context(
             cast(
                 httpx.AsyncClient,  # Interface is the same, but the type checker doesn't know that
-                httpxyz.AsyncClient(
+                httpx2.AsyncClient(
                     http2=True,
                     verify=ssl_context,
                     timeout=self._timeout,
-                    limits=httpxyz.Limits(max_connections=MAX_CONNECTION_POOL_SIZE),
+                    limits=httpx2.Limits(max_connections=MAX_CONNECTION_POOL_SIZE),
                 ),
             )
         )
@@ -555,11 +555,11 @@ class HttpxyzSyncBenchmark(HttpxSyncBenchmark):
         return self.exit_stack.enter_context(
             cast(
                 httpx.Client,  # Interface is the same, but the type checker doesn't know that
-                httpxyz.Client(
+                httpx2.Client(
                     http2=True,
                     verify=ssl_context,
                     timeout=self._timeout,
-                    limits=httpxyz.Limits(max_connections=MAX_CONNECTION_POOL_SIZE),
+                    limits=httpx2.Limits(max_connections=MAX_CONNECTION_POOL_SIZE),
                 ),
             )
         )
@@ -1082,11 +1082,11 @@ TEST_CLASSES = {
     "httpx_ms_trio": HttpxMsTrioBenchmark,
     "httpx_ms_sync": HttpxMsSyncBenchmark,
     "httpx_ms_threaded": HttpxMsSyncBenchmark,
-    "httpxyz_asyncio": HttpxyzAsyncioBenchmark,
-    "httpxyz_uvloop": HttpxyzUvloopBenchmark,
-    "httpxyz_trio": HttpxyzTrioBenchmark,
-    "httpxyz_sync": HttpxyzSyncBenchmark,
-    "httpxyz_threaded": HttpxyzSyncBenchmark,
+    "httpx2_asyncio": HttpxyzAsyncioBenchmark,
+    "httpx2_uvloop": HttpxyzUvloopBenchmark,
+    "httpx2_trio": HttpxyzTrioBenchmark,
+    "httpx2_sync": HttpxyzSyncBenchmark,
+    "httpx2_threaded": HttpxyzSyncBenchmark,
     "httpx_pyreqwest": HttpxPyreqwestBenchmark,
     "httpx_pyreqwest_uvloop": HttpxPyreqwestUvloopBenchmark,
     "httpx_pyreqwest_sync": HttpxPyreqwestSyncBenchmark,
